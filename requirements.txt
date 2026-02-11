@@ -1,0 +1,5 @@
+opencv-python>=4.9.0
+numpy>=1.26.0
+requests>=2.31.0
+onvif-zeep>=0.2.12
+ultralytics>=8.2.0
