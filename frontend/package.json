@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
+    "prebuild": "node scripts/bump-build.js",
     "build": "vite build",
     "preview": "vite preview"
   },
