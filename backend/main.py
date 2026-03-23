@@ -338,6 +338,11 @@ PTZ_ACTIONS = {
 }
 
 
+@app.get("/api/ptz/position")
+async def api_ptz_position():
+    return await cam.get_position()
+
+
 @app.post("/api/ptz/{action}")
 async def api_ptz(action: str, speed: int = 10):
     fn = PTZ_ACTIONS.get(action.lower())

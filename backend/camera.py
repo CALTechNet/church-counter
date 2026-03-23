@@ -6,6 +6,7 @@ Captures frames continuously during camera movement for denser coverage.
 """
 import asyncio
 import logging
+import re
 import time
 from typing import List, Optional, Callable, Awaitable
 
@@ -58,6 +59,33 @@ async def go_home():
     await call_preset(HOME_PRESET)
     await asyncio.sleep(1.0)
     logger.info("Camera returned to home position")
+
+
+# ── Position query ─────────────────────────────────────────────────────────────
+def _parse_var(text: str, name: str) -> Optional[int]:
+    m = re.search(rf"(?:var\s+)?{name}\s*[=:]\s*(-?\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+async def get_position() -> dict:
+    """Query the camera's current pan/tilt/zoom position.
+
+    PTZ Optics cameras expose current position via param.cgi.
+    Returns a dict with keys pan, tilt, zoom (int or None on error).
+    """
+    url = f"http://{CAMERA_IP}/cgi-bin/param.cgi?get_pan_tilt_zoom"
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        try:
+            resp = await client.get(url)
+            text = resp.text
+            return {
+                "pan":  _parse_var(text, "pan"),
+                "tilt": _parse_var(text, "tilt"),
+                "zoom": _parse_var(text, "zoom"),
+            }
+        except Exception as exc:
+            logger.debug(f"get_position failed: {exc}")
+            return {"pan": None, "tilt": None, "zoom": None}
 
 
 # ── Frame capture ─────────────────────────────────────────────────────────────
