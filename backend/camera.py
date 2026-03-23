@@ -6,7 +6,7 @@ Captures frames continuously during camera movement for denser coverage.
 """
 import asyncio
 import logging
-import re
+import socket
 import time
 from typing import List, Optional, Callable, Awaitable
 
@@ -16,9 +16,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-CAMERA_IP = "10.10.140.140"
-PTZ_BASE = f"http://{CAMERA_IP}/cgi-bin/ptzctrl.cgi"
-RTSP_URL = f"rtsp://{CAMERA_IP}:554/1"
+CAMERA_IP   = "10.10.140.140"
+PTZ_BASE    = f"http://{CAMERA_IP}/cgi-bin/ptzctrl.cgi"
+RTSP_URL    = f"rtsp://{CAMERA_IP}:554/1"
+VISCA_PORT  = 5678
 
 # ── Scan presets — zigzag grid 100–149 ───────────────────────────────────────
 SCAN_PRESETS = list(range(100, 132))  # 100, 101, 102, ... 149
@@ -61,31 +62,44 @@ async def go_home():
     logger.info("Camera returned to home position")
 
 
-# ── Position query ─────────────────────────────────────────────────────────────
-def _parse_var(text: str, name: str) -> Optional[int]:
-    m = re.search(rf"(?:var\s+)?{name}\s*[=:]\s*(-?\d+)", text)
-    return int(m.group(1)) if m else None
+# ── Position query (VISCA over TCP port 5678) ─────────────────────────────────
+def _decode_nibbles(b: bytes) -> int:
+    """Decode 4 VISCA nibble bytes (0x0N) into a signed 16-bit integer."""
+    val = ((b[0] & 0x0F) << 12 | (b[1] & 0x0F) << 8 |
+           (b[2] & 0x0F) << 4  | (b[3] & 0x0F))
+    return val - 0x10000 if val >= 0x8000 else val
 
 
 async def get_position() -> dict:
-    """Query the camera's current pan/tilt/zoom position.
+    """Query pan/tilt/zoom via VISCA over TCP (port 5678).
 
-    PTZ Optics cameras expose current position via param.cgi.
+    Sends two VISCA inquiry commands on one connection and decodes the
+    4-nibble signed 16-bit position values from the responses.
     Returns a dict with keys pan, tilt, zoom (int or None on error).
     """
-    url = f"http://{CAMERA_IP}/cgi-bin/param.cgi?get_pan_tilt_zoom"
-    async with httpx.AsyncClient(timeout=2.0) as client:
+    def _query():
         try:
-            resp = await client.get(url)
-            text = resp.text
-            return {
-                "pan":  _parse_var(text, "pan"),
-                "tilt": _parse_var(text, "tilt"),
-                "zoom": _parse_var(text, "zoom"),
-            }
+            with socket.create_connection((CAMERA_IP, VISCA_PORT), timeout=2.0) as sock:
+                sock.settimeout(1.0)
+                sock.sendall(b'\x81\x09\x06\x12\xFF')   # Pan/Tilt inquiry
+                pt = sock.recv(64)
+                sock.sendall(b'\x81\x09\x04\x47\xFF')   # Zoom inquiry
+                z  = sock.recv(64)
+                return pt, z
         except Exception as exc:
             logger.debug(f"get_position failed: {exc}")
-            return {"pan": None, "tilt": None, "zoom": None}
+            return None, None
+
+    pt_data, z_data = await asyncio.to_thread(_query)
+
+    pan = tilt = zoom = None
+    if pt_data and len(pt_data) >= 10 and pt_data[0] == 0x90 and pt_data[1] == 0x50:
+        pan  = _decode_nibbles(pt_data[2:6])
+        tilt = _decode_nibbles(pt_data[6:10])
+    if z_data and len(z_data) >= 6 and z_data[0] == 0x90 and z_data[1] == 0x50:
+        zoom = _decode_nibbles(z_data[2:6])
+
+    return {"pan": pan, "tilt": tilt, "zoom": zoom}
 
 
 # ── Frame capture ─────────────────────────────────────────────────────────────
