@@ -3,6 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   Legend, ResponsiveContainer
 } from 'recharts'
+import { useIsMobile } from '../hooks/useIsMobile.js'
 
 const TOTAL_SEATS = 1075
 
@@ -35,6 +36,7 @@ const RANGE_OPTIONS = [
 ]
 
 export default function AttendanceGraph() {
+  const isMobile = useIsMobile()
   const [records, setRecords]           = useState([])
   const [tableRecords, setTableRecords] = useState([])
   const [loading, setLoading]           = useState(true)
@@ -170,10 +172,10 @@ export default function AttendanceGraph() {
   const maxRecord   = filteredRecords.reduce((best, r) => total(r) > total(best || {}) ? r : best, null)
 
   return (
-    <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 20, overflowY: 'auto', flex: 1 }}>
+    <div style={{ padding: isMobile ? 12 : 24, display: 'flex', flexDirection: 'column', gap: isMobile ? 12 : 20, overflowY: 'auto', flex: 1 }}>
 
       {/* Stats row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'repeat(2, 1fr)' : 'repeat(4, 1fr)', gap: isMobile ? 8 : 12 }}>
         <StatCard label="Scans in Range"  value={totalScans} />
         <StatCard label="Avg Attendance"  value={avgOccupied} sub={`${Math.round(avgOccupied / TOTAL_SEATS * 100)}% capacity`} />
         <StatCard label="High in Range"   value={maxRecord ? total(maxRecord) : '—'} sub={maxRecord ? new Date(maxRecord.timestamp).toLocaleDateString() : ''} />
@@ -181,7 +183,7 @@ export default function AttendanceGraph() {
       </div>
 
       {/* Chart */}
-      <div style={{ background: C.surface, borderRadius: 12, padding: 20, border: `1px solid ${C.border}` }}>
+      <div style={{ background: C.surface, borderRadius: 12, padding: isMobile ? 12 : 20, border: `1px solid ${C.border}` }}>
         {/* Chart header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: dateRange === 'custom' ? 12 : 16, flexWrap: 'wrap', gap: 8 }}>
           <span style={{ color: C.text, fontWeight: 600, fontSize: 14 }}>Attendance Over Time</span>
@@ -247,7 +249,7 @@ export default function AttendanceGraph() {
           </div>
         ) : (
           <>
-            <ResponsiveContainer width="100%" height={300}>
+            <ResponsiveContainer width="100%" height={isMobile ? 220 : 300}>
               <LineChart data={visibleData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                 <XAxis dataKey="date" tick={{ fill: C.muted, fontSize: 11 }} tickLine={false} axisLine={{ stroke: C.border }} />

@@ -25,3 +25,19 @@ body {
 .recharts-wrapper {
   user-select: none;
 }
+
+/* Smooth scrolling on touch devices */
+* {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Prevent text size inflation on mobile */
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Tables scroll horizontally on small screens */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}

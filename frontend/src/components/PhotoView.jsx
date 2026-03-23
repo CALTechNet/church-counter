@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
+import { useIsMobile } from '../hooks/useIsMobile.js'
 
 const C = { bg: '#0f172a', surface: '#1e293b', muted: '#94a3b8', border: '#334155', text: '#f1f5f9' }
 
 export default function PhotoView({ imageB64: propB64, scanning }) {
+  const isMobile = useIsMobile()
   const [scans, setScans]           = useState([])   // newest-first
   const [selectedId, setSelectedId] = useState(null)
   const [imageB64, setImageB64]     = useState(propB64)
@@ -79,10 +81,10 @@ export default function PhotoView({ imageB64: propB64, scanning }) {
     <div style={{ flex:1, display:'flex', flexDirection:'column', background: C.bg, position:'relative' }}>
 
       {/* Toolbar */}
-      <div style={{ background: C.surface, borderBottom:`1px solid ${C.border}`, padding:'8px 20px', display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' }}>
+      <div style={{ background: C.surface, borderBottom:`1px solid ${C.border}`, padding: isMobile ? '8px 12px' : '8px 20px', display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
 
         {/* Scan picker */}
-        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:6, flex: isMobile ? '1 1 auto' : '0 0 auto' }}>
           <span style={{ fontSize:12, color:C.muted, whiteSpace:'nowrap' }}>Scan:</span>
           <select
             value={selectedId ?? ''}
@@ -90,7 +92,8 @@ export default function PhotoView({ imageB64: propB64, scanning }) {
             disabled={scanning || scans.length === 0}
             style={{
               background:'#0f172a', border:`1px solid ${C.border}`, color:C.text,
-              borderRadius:6, padding:'4px 8px', fontSize:12, cursor:'pointer', maxWidth:360,
+              borderRadius:6, padding:'4px 8px', fontSize:12, cursor:'pointer',
+              flex: isMobile ? '1 1 0' : '0 0 auto', maxWidth: isMobile ? '100%' : 360, minWidth:0,
             }}
           >
             {scans.length === 0 && <option value="">No scans yet</option>}
@@ -109,27 +112,29 @@ export default function PhotoView({ imageB64: propB64, scanning }) {
           </select>
         </div>
 
-        {/* Info label */}
-        <span style={{ fontSize:12, color:C.muted }}>
-          {displayTs
-            ? `Captured ${new Date(displayTs).toLocaleString()}`
-            : 'Latest scan'}
-          {count !== null && ` · ${count} people`}
-        </span>
+        {/* Info label — hidden on mobile to save space */}
+        {!isMobile && (
+          <span style={{ fontSize:12, color:C.muted }}>
+            {displayTs
+              ? `Captured ${new Date(displayTs).toLocaleString()}`
+              : 'Latest scan'}
+            {count !== null && ` · ${count} people`}
+          </span>
+        )}
 
         {/* Zoom + download */}
-        <div style={{ marginLeft:'auto', display:'flex', gap:8 }}>
-          {[['＋', 1.3], ['100%', 0], ['－', 0.75]].map(([lbl, f]) => (
+        <div style={{ marginLeft:'auto', display:'flex', gap:6 }}>
+          {[['＋', 1.3], ['1:1', 0], ['－', 0.75]].map(([lbl, f]) => (
             <button key={lbl}
               onClick={() => f === 0 ? setZoom(1) : setZoom(z => Math.max(0.3, Math.min(8, z * f)))}
-              style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.text, borderRadius:6, padding:'4px 12px', cursor:'pointer', fontSize:13 }}>
+              style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.text, borderRadius:6, padding:'4px 10px', cursor:'pointer', fontSize:13 }}>
               {lbl}
             </button>
           ))}
-          {imageB64 && (
+          {imageB64 && !isMobile && (
             <a href={`data:image/jpeg;base64,${imageB64}`} download="scan.jpg"
-              style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.text, borderRadius:6, padding:'4px 12px', textDecoration:'none', fontSize:13 }}>
-              ↓ Download
+              style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.text, borderRadius:6, padding:'4px 10px', textDecoration:'none', fontSize:13 }}>
+              ↓
             </a>
           )}
         </div>
