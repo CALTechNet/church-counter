@@ -42,6 +42,7 @@ state = {
     "latest_timestamp": None,
     "latest_service": None,
     "latest_image_b64": None,
+    "latest_raw_image_b64": None,
     "latest_seat_states": {},
     "latest_detections": [],
 }
@@ -95,6 +96,7 @@ async def run_scan(service_type: str = "Manual"):
 
         # 3. Detect
         await _progress("Running AI detection…", 96)
+        raw_image_b64 = stitch.to_base64(panorama)
         detections = det.detect_people(panorama)
         annotated  = det.draw_detections(panorama, detections)
         image_b64  = stitch.to_base64(annotated)
@@ -121,7 +123,7 @@ async def run_scan(service_type: str = "Manual"):
 
         # 6. Persist
         occupied = [k for k, v in seat_states.items() if v == "occupied"]
-        db.save_scan(ts, service_type, total, occupied, image_b64)
+        db.save_scan(ts, service_type, total, occupied, image_b64, raw_image_b64=raw_image_b64)
 
         # 7. Update shared state
         state.update(
@@ -129,18 +131,20 @@ async def run_scan(service_type: str = "Manual"):
             latest_timestamp=ts,
             latest_service=service_type,
             latest_image_b64=image_b64,
+            latest_raw_image_b64=raw_image_b64,
             latest_seat_states=seat_states,
             latest_detections=detections,
         )
 
         await _progress("Complete!", 100)
         await _broadcast({
-            "type":         "scan_complete",
-            "count":        total,
-            "timestamp":    ts,
-            "service_type": service_type,
-            "seat_states":  seat_states,
-            "image_b64":    image_b64,
+            "type":           "scan_complete",
+            "count":          total,
+            "timestamp":      ts,
+            "service_type":   service_type,
+            "seat_states":    seat_states,
+            "image_b64":      image_b64,
+            "raw_image_b64":  raw_image_b64,
         })
         logger.info(f"Scan done: {total} people  service={service_type}  ts={ts}")
 
@@ -211,9 +215,9 @@ async def api_latest_image():
     if not b64:
         row = db.get_latest_scan()
         if row and row.get("stitched_image"):
-            return {"image_b64": row["stitched_image"], "timestamp": row["timestamp"]}
+            return {"image_b64": row["stitched_image"], "raw_image_b64": row.get("raw_image"), "timestamp": row["timestamp"]}
         raise HTTPException(404, "No scan image available yet")
-    return {"image_b64": b64, "timestamp": ts}
+    return {"image_b64": b64, "raw_image_b64": state.get("latest_raw_image_b64"), "timestamp": ts}
 
 
 @app.get("/api/attendance")
@@ -241,11 +245,16 @@ async def api_create_scan(entry: ManualEntry):
 @app.get("/api/attendance/{scan_id}/image")
 async def api_scan_image(scan_id: int):
     """Return the stitched image for a specific scan by ID."""
-    img = db.get_scan_image(scan_id)
-    if not img:
+    imgs = db.get_scan_image(scan_id)
+    if not imgs or not imgs.get("annotated"):
         raise HTTPException(404, f"No image saved for scan {scan_id}")
     scan = next((s for s in db.get_all_scans() if s.get("id") == scan_id), {})
-    return {"image_b64": img, "timestamp": scan.get("timestamp"), "count": scan.get("count")}
+    return {
+        "image_b64":     imgs["annotated"],
+        "raw_image_b64": imgs.get("raw"),
+        "timestamp":     scan.get("timestamp"),
+        "count":         scan.get("count"),
+    }
 
 
 class ScanUpdate(BaseModel):

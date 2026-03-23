@@ -26,6 +26,7 @@ def init_db():
     for migration in [
         "ALTER TABLE scans ADD COLUMN manual_add INTEGER DEFAULT 0",
         "ALTER TABLE scans ADD COLUMN archived  INTEGER DEFAULT 0",
+        "ALTER TABLE scans ADD COLUMN raw_image  TEXT",
     ]:
         try:
             c.execute(migration)
@@ -45,12 +46,12 @@ def init_db():
     conn.close()
 
 
-def save_scan(timestamp, service_type, total_count, occupied_seats, stitched_image_b64, notes=None):
+def save_scan(timestamp, service_type, total_count, occupied_seats, stitched_image_b64, notes=None, raw_image_b64=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO scans (timestamp, service_type, total_count, occupied_seats, stitched_image, notes) VALUES (?,?,?,?,?,?)",
-        (timestamp, service_type, total_count, json.dumps(occupied_seats), stitched_image_b64, notes),
+        "INSERT INTO scans (timestamp, service_type, total_count, occupied_seats, stitched_image, notes, raw_image) VALUES (?,?,?,?,?,?,?)",
+        (timestamp, service_type, total_count, json.dumps(occupied_seats), stitched_image_b64, notes, raw_image_b64),
     )
     scan_id = c.lastrowid
     conn.commit()
@@ -139,13 +140,15 @@ def clear_calibration():
     conn.close()
 
 def get_scan_image(scan_id: int):
-    """Fetch just the stitched image for a single scan by ID."""
+    """Fetch the annotated and raw images for a single scan by ID."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT stitched_image FROM scans WHERE id = ?", (scan_id,))
+    c.execute("SELECT stitched_image, raw_image FROM scans WHERE id = ?", (scan_id,))
     row = c.fetchone()
     conn.close()
-    return row[0] if row else None
+    if not row:
+        return None
+    return {"annotated": row[0], "raw": row[1]}
 
 
 def update_scan(scan_id: int, notes: str = None, manual_add: int = None,
