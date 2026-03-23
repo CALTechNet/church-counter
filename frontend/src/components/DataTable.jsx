@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
 import { getAttendance } from '../api.js'
+import { useIsMobile } from '../hooks/useIsMobile.js'
 
 const C = { bg:'#0f172a', surface:'#1e293b', border:'#334155', text:'#f1f5f9', muted:'#94a3b8', accent:'#3b82f6', green:'#22c55e', red:'#ef4444' }
 const SVC_COLORS = { 'Sunday Morning':'#3b82f6','Sunday Midday':'#a855f7','Wednesday Evening':'#f59e0b','Manual':'#64748b','Test':'#f43f5e' }
 
 export default function DataTable() {
+  const isMobile = useIsMobile()
   const [scans, setScans]       = useState([])
   const [loading, setLoading]   = useState(true)
   const [filter, setFilter]     = useState('All')
@@ -245,35 +247,37 @@ export default function DataTable() {
     <div style={{ flex:1, display:'flex', flexDirection:'column', background:C.bg }}>
 
       {/* Toolbar */}
-      <div style={{ background:C.surface, borderBottom:`1px solid ${C.border}`, padding:'10px 20px', display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' }}>
-        <span style={{ fontSize:14, color:C.muted }}>{filtered.length} records</span>
-        <div style={{ display:'flex', gap:6, marginLeft:8 }}>
+      <div style={{ background:C.surface, borderBottom:`1px solid ${C.border}`, padding: isMobile ? '8px 12px' : '10px 20px', display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+        <span style={{ fontSize:13, color:C.muted, whiteSpace:'nowrap' }}>{filtered.length} records</span>
+        <div style={{ display:'flex', gap:4, flexWrap:'wrap' }}>
           {services.map(s => (
             <button key={s} onClick={() => setFilter(s)} style={{
               background: filter===s ? C.accent : 'transparent',
               border: `1px solid ${filter===s ? C.accent : C.border}`,
               color: filter===s ? '#fff' : C.muted,
-              borderRadius:20, padding:'3px 12px', cursor:'pointer', fontSize:12,
+              borderRadius:20, padding: isMobile ? '3px 10px' : '3px 12px', cursor:'pointer', fontSize:11,
             }}>{s}</button>
           ))}
         </div>
-        <button onClick={() => setSortDesc(d => !d)} style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.muted, borderRadius:6, padding:'4px 12px', cursor:'pointer', fontSize:12, marginLeft:'auto' }}>
-          {sortDesc ? '↓ Newest first' : '↑ Oldest first'}
-        </button>
-        <button onClick={() => setShowArchived(v => !v)} style={{
-          background: showArchived ? '#78350f' : 'transparent',
-          border: `1px solid ${showArchived ? '#b45309' : C.border}`,
-          color: showArchived ? '#fde68a' : C.muted,
-          borderRadius:6, padding:'4px 12px', cursor:'pointer', fontSize:12,
-        }}>
-          {showArchived ? '📦 Hide Archived' : '📦 Show Archived'}
-        </button>
-        <button onClick={openManualEntry} style={{ background:'#16a34a', color:'#fff', border:'none', borderRadius:6, padding:'6px 16px', cursor:'pointer', fontWeight:600, fontSize:13 }}>
-          + Manual Entry
-        </button>
-        <button onClick={exportCSV} style={{ background:C.accent, color:'#fff', border:'none', borderRadius:6, padding:'6px 16px', cursor:'pointer', fontWeight:600, fontSize:13 }}>
-          ↓ Export CSV
-        </button>
+        <div style={{ display:'flex', gap:6, marginLeft:'auto', flexWrap:'wrap', justifyContent:'flex-end' }}>
+          <button onClick={() => setSortDesc(d => !d)} style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.muted, borderRadius:6, padding:'4px 10px', cursor:'pointer', fontSize:11, whiteSpace:'nowrap' }}>
+            {sortDesc ? '↓ Newest' : '↑ Oldest'}
+          </button>
+          <button onClick={() => setShowArchived(v => !v)} style={{
+            background: showArchived ? '#78350f' : 'transparent',
+            border: `1px solid ${showArchived ? '#b45309' : C.border}`,
+            color: showArchived ? '#fde68a' : C.muted,
+            borderRadius:6, padding:'4px 10px', cursor:'pointer', fontSize:11, whiteSpace:'nowrap',
+          }}>
+            {showArchived ? '📦 Hide' : '📦 Archived'}
+          </button>
+          <button onClick={openManualEntry} style={{ background:'#16a34a', color:'#fff', border:'none', borderRadius:6, padding:'6px 12px', cursor:'pointer', fontWeight:600, fontSize:12, whiteSpace:'nowrap' }}>
+            + Add
+          </button>
+          <button onClick={exportCSV} style={{ background:C.accent, color:'#fff', border:'none', borderRadius:6, padding:'6px 12px', cursor:'pointer', fontWeight:600, fontSize:12, whiteSpace:'nowrap' }}>
+            ↓ CSV
+          </button>
+        </div>
       </div>
 
       {/* Table */}
@@ -407,31 +411,41 @@ export default function DataTable() {
         <div onClick={() => setModal(null)} style={{
           position:'fixed', inset:0, background:'rgba(0,0,0,0.85)',
           display:'flex', alignItems:'center', justifyContent:'center',
-          zIndex:9999, padding:'24px 16px', gap:12,
+          zIndex:9999, padding: isMobile ? '8px' : '24px 16px', gap: isMobile ? 0 : 12,
+          flexDirection: isMobile ? 'column' : 'row',
         }}>
 
-          {/* Left arrow (older) */}
-          <NavArrow dir={-1} disabled={!hasPrev} onClick={e => { e.stopPropagation(); navigateModal(-1) }} />
+          {/* Left arrow (older) — hidden on mobile, shown as inline button in header */}
+          {!isMobile && <NavArrow dir={-1} disabled={!hasPrev} onClick={e => { e.stopPropagation(); navigateModal(-1) }} />}
 
           {/* Modal card */}
           <div onClick={e => e.stopPropagation()} style={{
             background:C.surface, borderRadius:12, border:`1px solid ${C.border}`,
-            width:'min(95vw, 1100px)', maxHeight:'90vh', overflow:'hidden',
+            width: isMobile ? '100%' : 'min(95vw, 1100px)',
+            maxHeight: isMobile ? '100%' : '90vh',
+            height: isMobile ? '100%' : undefined,
+            overflow:'hidden',
             display:'flex', flexDirection:'column', flex:'0 1 auto',
           }}>
 
             {/* Modal header */}
-            <div style={{ padding:'12px 20px', borderBottom:`1px solid ${C.border}`, display:'flex', justifyContent:'space-between', alignItems:'center', gap:8 }}>
-              <div style={{ display:'flex', alignItems:'center', gap:12, minWidth:0 }}>
-                <span style={{ color:C.text, fontWeight:600, fontSize:14, whiteSpace:'nowrap' }}>
-                  {new Date(modal.scan.timestamp).toLocaleString()}
-                </span>
-                <span style={{ color:C.muted, fontSize:13, whiteSpace:'nowrap' }}>
-                  {modal.scan.service_type || 'Manual'}
-                </span>
+            <div style={{ padding:'12px 16px', borderBottom:`1px solid ${C.border}`, display:'flex', justifyContent:'space-between', alignItems:'center', gap:8, flexShrink:0 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:8, minWidth:0, flex:1 }}>
+                {/* Mobile nav arrows inline */}
+                {isMobile && (
+                  <NavArrow dir={-1} disabled={!hasPrev} onClick={e => { e.stopPropagation(); navigateModal(-1) }} />
+                )}
+                <div style={{ minWidth:0 }}>
+                  <div style={{ color:C.text, fontWeight:600, fontSize: isMobile ? 12 : 14, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
+                    {new Date(modal.scan.timestamp).toLocaleString()}
+                  </div>
+                  <div style={{ color:C.muted, fontSize:12 }}>{modal.scan.service_type || 'Manual'}</div>
+                </div>
+                {isMobile && (
+                  <NavArrow dir={+1} disabled={!hasNext} onClick={e => { e.stopPropagation(); navigateModal(+1) }} />
+                )}
               </div>
-              <div style={{ display:'flex', alignItems:'center', gap:12, flexShrink:0 }}>
-                {/* Position counter */}
+              <div style={{ display:'flex', alignItems:'center', gap:8, flexShrink:0 }}>
                 <span style={{ color:C.muted, fontSize:12, whiteSpace:'nowrap' }}>
                   {modalIdx + 1} / {sortedFiltered.length}
                 </span>
@@ -439,10 +453,10 @@ export default function DataTable() {
               </div>
             </div>
 
-            <div style={{ display:'flex', flex:1, overflow:'hidden', minHeight:0 }}>
+            <div style={{ display:'flex', flex:1, overflow:'hidden', minHeight:0, flexDirection: isMobile ? 'column' : 'row' }}>
 
-              {/* Left — zoomable image */}
-              <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+              {/* Top/Left — zoomable image */}
+              <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minHeight: isMobile ? 200 : 0 }}>
                 <div
                   onWheel={handleWheel}
                   onMouseDown={handleMouseDown}
@@ -450,7 +464,7 @@ export default function DataTable() {
                   onMouseUp={handleMouseUp}
                   onMouseLeave={handleMouseUp}
                   style={{
-                    flex:1, overflow:'hidden', padding:16,
+                    flex:1, overflow:'hidden', padding: isMobile ? 8 : 16,
                     display:'flex', alignItems:'flex-start', justifyContent:'center',
                     cursor: zoom > 1 ? (panning ? 'grabbing' : 'grab') : 'zoom-in',
                     userSelect:'none',
@@ -476,7 +490,7 @@ export default function DataTable() {
 
                 {/* Zoom controls */}
                 {modal.imageB64 && (
-                  <div style={{ padding:'8px 16px', borderTop:`1px solid ${C.border}`, display:'flex', alignItems:'center', gap:10, background:C.bg, flexShrink:0 }}>
+                  <div style={{ padding:'6px 12px', borderTop:`1px solid ${C.border}`, display:'flex', alignItems:'center', gap:8, background:C.bg, flexShrink:0 }}>
                     <button onClick={() => setZoom(z => Math.max(z * 0.8, 1))}
                       style={{ background:C.border, border:'none', color:C.text, borderRadius:6, width:28, height:28, cursor:'pointer', fontSize:16, lineHeight:'28px' }}>−</button>
                     <span style={{ color:C.muted, fontSize:12, minWidth:44, textAlign:'center' }}>{Math.round(zoom * 100)}%</span>
@@ -484,13 +498,13 @@ export default function DataTable() {
                       style={{ background:C.border, border:'none', color:C.text, borderRadius:6, width:28, height:28, cursor:'pointer', fontSize:16, lineHeight:'28px' }}>+</button>
                     <button onClick={resetZoom}
                       style={{ background:'transparent', border:`1px solid ${C.border}`, color:C.muted, borderRadius:6, padding:'3px 10px', cursor:'pointer', fontSize:11 }}>Reset</button>
-                    <span style={{ color:C.muted, fontSize:11, marginLeft:4 }}>Scroll to zoom · Drag to pan</span>
+                    {!isMobile && <span style={{ color:C.muted, fontSize:11, marginLeft:4 }}>Scroll to zoom · Drag to pan</span>}
                   </div>
                 )}
               </div>
 
-              {/* Right — edit panel */}
-              <div style={{ width:260, borderLeft:`1px solid ${C.border}`, padding:20, display:'flex', flexDirection:'column', gap:20, overflowY:'auto' }}>
+              {/* Bottom/Right — edit panel */}
+              <div style={{ width: isMobile ? '100%' : 260, borderLeft: isMobile ? 'none' : `1px solid ${C.border}`, borderTop: isMobile ? `1px solid ${C.border}` : 'none', padding: isMobile ? '12px 16px' : 20, display:'flex', flexDirection:'column', gap: isMobile ? 12 : 20, overflowY:'auto', flexShrink:0 }}>
 
                 {/* Count summary */}
                 <div style={{ background:'rgba(59,130,246,0.08)', borderRadius:8, padding:12, border:`1px solid ${C.border}` }}>
@@ -575,8 +589,8 @@ export default function DataTable() {
             </div>
           </div>
 
-          {/* Right arrow (newer) */}
-          <NavArrow dir={+1} disabled={!hasNext} onClick={e => { e.stopPropagation(); navigateModal(+1) }} />
+          {/* Right arrow (newer) — desktop only */}
+          {!isMobile && <NavArrow dir={+1} disabled={!hasNext} onClick={e => { e.stopPropagation(); navigateModal(+1) }} />}
 
         </div>
       )}

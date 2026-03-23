@@ -5,6 +5,7 @@ import DataTable from './components/DataTable.jsx'
 import CalibrationWizard from './components/CalibrationWizard.jsx'
 import { getStatus, triggerScan, createWebSocket } from './api.js'
 import { VERSION } from './version.js'
+import { useIsMobile } from './hooks/useIsMobile.js'
 
 const TABS = ['Photo', 'Attendance', 'Data']
 const SERVICE_TYPES = ['Manual', 'Sunday Morning', 'Sunday Midday', 'Wednesday Evening']
@@ -22,6 +23,7 @@ const C = {
 }
 
 export default function App() {
+  const isMobile = useIsMobile()
   const [tab, setTab]             = useState(0)
   const [scanState, setScanState] = useState({ running: false, progress: 0, message: 'Idle' })
   const [seatStates, setSeatStates] = useState({})
@@ -108,25 +110,40 @@ export default function App() {
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text, fontFamily: 'system-ui, sans-serif', display: 'flex', flexDirection: 'column' }}>
 
       {/* Header */}
-      <header style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '0 24px', display: 'flex', alignItems: 'center', gap: 16, height: 60 }}>
-        <span style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.5px' }}>⛪ Lakeshore Church</span>
-        <span style={{ color: C.muted, fontSize: 14 }}>Attendance Counter</span>
+      <header style={{
+        background: C.surface, borderBottom: `1px solid ${C.border}`,
+        padding: isMobile ? '8px 16px' : '0 24px',
+        display: 'flex', alignItems: 'center', gap: isMobile ? 8 : 16,
+        minHeight: 60, flexWrap: isMobile ? 'wrap' : 'nowrap',
+      }}>
+        {/* Branding */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: isMobile ? '1 1 auto' : '0 0 auto' }}>
+          <span style={{ fontSize: isMobile ? 18 : 22, fontWeight: 700, letterSpacing: '-0.5px', whiteSpace: 'nowrap' }}>⛪ Lakeshore Church</span>
+          {!isMobile && <span style={{ color: C.muted, fontSize: 14 }}>Attendance Counter</span>}
+        </div>
 
-        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>
-          {latestCount !== null && (
-            <div style={{ textAlign: 'right', marginRight: 8 }}>
-              <div style={{ fontSize: 24, fontWeight: 700, color: C.green, lineHeight: 1 }}>{latestCount}</div>
-              <div style={{ fontSize: 11, color: C.muted }}>
-                {latestService} · {latestTs ? new Date(latestTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-              </div>
+        {/* Latest count — inline on mobile, right-aligned on desktop */}
+        {latestCount !== null && (
+          <div style={{ textAlign: isMobile ? 'left' : 'right', marginRight: isMobile ? 0 : 8, flex: isMobile ? '0 0 auto' : '0 0 auto', marginLeft: isMobile ? 'auto' : 0 }}>
+            <div style={{ fontSize: isMobile ? 20 : 24, fontWeight: 700, color: C.green, lineHeight: 1 }}>{latestCount}</div>
+            <div style={{ fontSize: 10, color: C.muted, whiteSpace: 'nowrap' }}>
+              {isMobile ? '' : `${latestService} · `}{latestTs ? new Date(latestTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
             </div>
-          )}
+          </div>
+        )}
 
+        {/* Controls row — wraps to second line on mobile */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          flex: isMobile ? '1 1 100%' : '0 0 auto',
+          marginLeft: isMobile ? 0 : 'auto',
+          flexWrap: 'wrap',
+        }}>
           <select
             value={serviceType}
             onChange={e => setServiceType(e.target.value)}
             disabled={scanState.running}
-            style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, borderRadius: 6, padding: '6px 10px', fontSize: 13, cursor: 'pointer' }}
+            style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, borderRadius: 6, padding: '6px 8px', fontSize: 12, cursor: 'pointer', flex: isMobile ? '1 1 auto' : '0 0 auto' }}
           >
             {SERVICE_TYPES.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
@@ -137,9 +154,9 @@ export default function App() {
             style={{
               background: scanState.running ? C.border : C.accent,
               color: '#fff', border: 'none', borderRadius: 8,
-              padding: '8px 20px', fontWeight: 600, fontSize: 14,
+              padding: '8px 16px', fontWeight: 600, fontSize: 13,
               cursor: scanState.running ? 'not-allowed' : 'pointer',
-              transition: 'background 0.2s',
+              transition: 'background 0.2s', whiteSpace: 'nowrap',
             }}
           >
             {scanState.running ? '⏳ Scanning…' : '▶ Scan Now'}
@@ -149,7 +166,7 @@ export default function App() {
           {scanState.running && scanStartedAt && (Date.now() - scanStartedAt) > 300000 && (
             <button
               onClick={() => { setScanState({ running: false, progress: 0, message: 'Idle' }); setScanStartedAt(null) }}
-              style={{ background: C.red, color: '#fff', border: 'none', borderRadius: 8, padding: '8px 14px', fontWeight: 600, fontSize: 13, cursor: 'pointer' }}
+              style={{ background: C.red, color: '#fff', border: 'none', borderRadius: 8, padding: '8px 12px', fontWeight: 600, fontSize: 12, cursor: 'pointer' }}
               title="Force reset stuck scan state"
             >
               ✕ Reset
@@ -158,9 +175,9 @@ export default function App() {
 
           <button
             onClick={() => setShowCal(true)}
-            style={{ background: 'transparent', color: C.muted, border: `1px solid ${C.border}`, borderRadius: 8, padding: '7px 14px', fontSize: 13, cursor: 'pointer' }}
+            style={{ background: 'transparent', color: C.muted, border: `1px solid ${C.border}`, borderRadius: 8, padding: '7px 12px', fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' }}
           >
-            ⚙ Calibrate
+            ⚙{!isMobile && ' Calibrate'}
           </button>
         </div>
       </header>
@@ -178,17 +195,15 @@ export default function App() {
       )}
 
       {/* Tabs */}
-      <nav style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '0 24px', display: 'flex', gap: 0 }}>
+      <nav style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: isMobile ? '0 8px' : '0 24px', display: 'flex', gap: 0 }}>
         {TABS.map((t, i) => (
           <button key={t} onClick={() => setTab(i)} style={{
             background: 'transparent', border: 'none', color: tab === i ? C.text : C.muted,
             borderBottom: tab === i ? `2px solid ${C.accent}` : '2px solid transparent',
-            padding: '12px 20px', cursor: 'pointer', fontWeight: tab === i ? 600 : 400,
-            fontSize: 14, transition: 'color 0.15s',
+            padding: isMobile ? '12px 16px' : '12px 20px', cursor: 'pointer', fontWeight: tab === i ? 600 : 400,
+            fontSize: isMobile ? 13 : 14, transition: 'color 0.15s', flex: isMobile ? 1 : '0 0 auto', textAlign: 'center',
           }}>{t}</button>
         ))}
-
-
       </nav>
 
       {/* Content */}
