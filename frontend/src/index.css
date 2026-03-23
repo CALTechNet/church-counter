@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #0f172a;
+  color: #f1f5f9;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+/* Seat map dot animations */
+.seat-dot {
+  transition: fill 0.4s ease, r 0.2s ease;
+}
+.seat-dot:hover {
+  cursor: pointer;
+}
+
+/* Scan progress bar */
+.progress-bar {
+  transition: width 0.5s ease;
+}
+
+/* Graph zoom/scroll */
+.recharts-wrapper {
+  user-select: none;
+}

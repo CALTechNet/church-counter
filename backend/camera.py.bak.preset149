@@ -1,0 +1,112 @@
+"""
+PTZ Optics camera control for Lakeshore Church attendance scanner.
+Camera: 10.10.140.140, ceiling center-stage, looking out at congregation.
+Scan pattern: 41 presets (100-140) in a zigzag grid, left-to-right.
+"""
+import asyncio
+import logging
+from typing import List, Optional, Callable, Awaitable
+
+import httpx
+import cv2
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+CAMERA_IP = "10.10.140.140"
+PTZ_BASE = f"http://{CAMERA_IP}/cgi-bin/ptzctrl.cgi"
+RTSP_URL = f"rtsp://{CAMERA_IP}:554/1"
+
+# ── Scan presets — zigzag grid 100–140 ───────────────────────────────────────
+SCAN_PRESETS = list(range(100, 149))  # 100, 101, 102, ... 145
+
+HOME_PRESET = 0
+PRESET_SETTLE_TIME = 1.0  # seconds to wait after calling a preset before capturing
+
+
+# ── Low-level PTZ command ─────────────────────────────────────────────────────
+async def _ptz(action: str, s1: int = 0, s2: int = 0, timeout: float = 4.0):
+    url = f"{PTZ_BASE}?ptzcmd&{action}&{s1}&{s2}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.get(url)
+            logger.debug(f"PTZ {action} s1={s1} s2={s2} → {resp.status_code}")
+        except Exception as exc:
+            logger.warning(f"PTZ command failed ({action}): {exc}")
+
+
+# ── Preset helper ─────────────────────────────────────────────────────────────
+async def call_preset(preset: int):
+    """Call a saved preset — matches exact URL format the camera expects."""
+    url = f"{PTZ_BASE}?ptzcmd&poscall&{preset}"
+    async with httpx.AsyncClient(timeout=4.0) as client:
+        try:
+            resp = await client.get(url)
+            logger.debug(f"PTZ poscall preset={preset} → {resp.status_code}")
+        except Exception as exc:
+            logger.warning(f"Preset call failed (preset {preset}): {exc}")
+
+
+async def go_home():
+    """Return camera to home preset after scanning."""
+    await call_preset(HOME_PRESET)
+    await asyncio.sleep(PRESET_SETTLE_TIME)
+    logger.info("Camera returned to home position")
+
+
+# ── Frame capture ─────────────────────────────────────────────────────────────
+def capture_frame(url: str = RTSP_URL) -> Optional[np.ndarray]:
+    """Open RTSP stream, flush buffer, return latest frame."""
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    frame = None
+    for _ in range(8):
+        ret, f = cap.read()
+        if ret:
+            frame = f
+    cap.release()
+    if frame is None:
+        logger.warning("Failed to capture frame from RTSP stream")
+    return frame
+
+
+# ── Auto-scan ─────────────────────────────────────────────────────────────────
+ProgressCB = Callable[[str, int], Awaitable[None]]
+
+
+async def auto_scan(progress_callback: Optional[ProgressCB] = None) -> List[np.ndarray]:
+    """
+    Visit all presets in zigzag order, settle, and capture a frame at each.
+    Returns list of captured frames for stitching.
+    """
+    frames: List[np.ndarray] = []
+    total = len(SCAN_PRESETS)
+
+    async def prog(msg: str, pct: int):
+        logger.info(f"[{pct:3d}%] {msg}")
+        if progress_callback:
+            await progress_callback(msg, pct)
+
+    await prog("Starting grid scan…", 0)
+
+    for i, preset_id in enumerate(SCAN_PRESETS):
+        pct = int((i / total) * 88)
+        await prog(f"Preset {preset_id} ({i+1}/{total})…", pct)
+
+        await call_preset(preset_id)
+        await asyncio.sleep(PRESET_SETTLE_TIME)
+
+        f = await asyncio.to_thread(capture_frame)
+        if f is not None:
+            frames.append(f)
+            await prog(f"Captured preset {preset_id} — {len(frames)} frames", pct + 1)
+        else:
+            logger.warning(f"No frame captured at preset {preset_id}")
+
+    # ── Return home ───────────────────────────────────────────────────────────
+    await prog("Returning camera to home position…", 90)
+    await go_home()
+
+    await prog(f"Capture complete — {len(frames)} frames", 92)
+    logger.info(f"auto_scan finished: {len(frames)} frames captured")
+    return frames

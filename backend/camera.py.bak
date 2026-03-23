@@ -1,0 +1,178 @@
+"""
+PTZ Optics camera control for Lakeshore Church attendance scanner.
+Camera: 10.10.140.140, ceiling center-stage, looking out at congregation.
+"""
+import asyncio
+import logging
+import time
+from typing import List, Optional, Callable, Awaitable
+
+import httpx
+import cv2
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+CAMERA_IP = "10.10.140.140"
+PTZ_BASE = f"http://{CAMERA_IP}/cgi-bin/ptzctrl.cgi"
+RTSP_URL = f"rtsp://{CAMERA_IP}:554/1"
+
+# ── Scan tuning constants (edit in .env or via config if needed) ──────────────
+PAN_SPEED_SCAN = 10      # bumped from 4 — was too slow, frames looked identical
+PAN_SPEED_FAST = 16      # for repositioning
+TILT_SPEED = 5           # 1-20
+FRAME_INTERVAL = 1.8     # seconds between frame captures during sweep
+PAN_FULL_TIME = 14       # seconds to sweep full arc (left→right)
+TILT_UP_TIME = 2.2       # seconds to tilt up to balcony level
+SETTLE_TIME = 1.5        # seconds to wait after stopping before capture
+HOME_TILT_DOWN_TIME = 2.5  # seconds to tilt back down to center
+
+
+# ── Low-level PTZ command ─────────────────────────────────────────────────────
+async def _ptz(action: str, s1: int = 0, s2: int = 0, timeout: float = 4.0):
+    url = f"{PTZ_BASE}?ptzcmd&{action}&{s1}&{s2}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.get(url)
+            logger.debug(f"PTZ {action} s1={s1} s2={s2} → {resp.status_code}")
+        except Exception as exc:
+            logger.warning(f"PTZ command failed ({action}): {exc}")
+
+
+# ── Movement helpers ──────────────────────────────────────────────────────────
+async def pan_left(speed: int = PAN_SPEED_SCAN):   await _ptz("LEFT",  speed, 0)
+async def pan_right(speed: int = PAN_SPEED_SCAN):  await _ptz("RIGHT", speed, 0)
+async def tilt_up(speed: int = TILT_SPEED):        await _ptz("UP",    0, speed)
+async def tilt_down(speed: int = TILT_SPEED):      await _ptz("DOWN",  0, speed)
+async def zoom_in(speed: int = 3):                 await _ptz("ZOOMIN",  speed, 0)
+async def zoom_out(speed: int = 3):                await _ptz("ZOOMOUT", speed, 0)
+async def zoom_stop():                             await _ptz("ZOOMSTOP", 0, 0)
+async def stop():                                  await _ptz("PTZSTOP", 0, 0)
+
+
+# ── Frame capture ─────────────────────────────────────────────────────────────
+def capture_frame(url: str = RTSP_URL) -> Optional[np.ndarray]:
+    """Open RTSP stream, flush buffer, return latest frame."""
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    frame = None
+    # Read more frames to properly flush stale buffer
+    for _ in range(8):
+        ret, f = cap.read()
+        if ret:
+            frame = f
+    cap.release()
+    if frame is None:
+        logger.warning("Failed to capture frame from RTSP stream")
+    return frame
+
+
+# ── Home position ─────────────────────────────────────────────────────────────
+async def go_home():
+    """Return camera to a neutral center position after scanning."""
+    await stop()
+    await asyncio.sleep(0.4)
+    # Pan back to center (pan right half-sweep from full-left)
+    await pan_right(PAN_SPEED_FAST)
+    await asyncio.sleep(PAN_FULL_TIME / 2)
+    await stop()
+    # Tilt down to level
+    await tilt_down(TILT_SPEED)
+    await asyncio.sleep(HOME_TILT_DOWN_TIME)
+    await stop()
+    logger.info("Camera returned to home position")
+
+
+# ── Auto-scan ─────────────────────────────────────────────────────────────────
+ProgressCB = Callable[[str, int], Awaitable[None]]
+
+
+async def auto_scan(progress_callback: Optional[ProgressCB] = None) -> List[np.ndarray]:
+    """
+    Full-room sweep:
+      1. Drive to far-left, pan right across main floor capturing frames
+      2. Tilt up to balcony level, pan left back capturing frames
+      3. Return home
+    Returns list of captured frames for stitching.
+    """
+    frames: List[np.ndarray] = []
+
+    async def prog(msg: str, pct: int):
+        logger.info(f"[{pct:3d}%] {msg}")
+        if progress_callback:
+            await progress_callback(msg, pct)
+
+    # ── Step 1: drive to far-left ─────────────────────────────────────────────
+    await prog("Moving to start position (far left)…", 3)
+    await stop()
+    await pan_left(PAN_SPEED_FAST)
+    await asyncio.sleep(PAN_FULL_TIME * 0.85)
+    await stop()
+    await asyncio.sleep(SETTLE_TIME)
+
+    # Capture first frame
+    f = await asyncio.to_thread(capture_frame)
+    if f is not None:
+        frames.append(f)
+
+    # ── Step 2: main-floor sweep → right ─────────────────────────────────────
+    await prog("Main floor sweep — panning right…", 10)
+    await pan_right(PAN_SPEED_SCAN)
+    sweep_start = time.monotonic()
+
+    while True:
+        await asyncio.sleep(FRAME_INTERVAL)
+        elapsed = time.monotonic() - sweep_start
+        if elapsed >= PAN_FULL_TIME:
+            break
+        f = await asyncio.to_thread(capture_frame)
+        if f is not None:
+            frames.append(f)
+            pct = 10 + int((elapsed / PAN_FULL_TIME) * 35)
+            await prog(f"Main floor — frame {len(frames)}", pct)
+
+    await stop()
+    await asyncio.sleep(SETTLE_TIME)
+    f = await asyncio.to_thread(capture_frame)
+    if f is not None:
+        frames.append(f)
+
+    # ── Step 3: tilt up to balcony ────────────────────────────────────────────
+    await prog("Tilting up to balcony level…", 50)
+    await tilt_up(TILT_SPEED)
+    await asyncio.sleep(TILT_UP_TIME)
+    await stop()
+    await asyncio.sleep(SETTLE_TIME)
+    f = await asyncio.to_thread(capture_frame)
+    if f is not None:
+        frames.append(f)
+
+    # ── Step 4: balcony sweep ← left ─────────────────────────────────────────
+    await prog("Balcony sweep — panning left…", 58)
+    await pan_left(PAN_SPEED_SCAN)
+    sweep_start = time.monotonic()
+
+    while True:
+        await asyncio.sleep(FRAME_INTERVAL)
+        elapsed = time.monotonic() - sweep_start
+        if elapsed >= PAN_FULL_TIME:
+            break
+        f = await asyncio.to_thread(capture_frame)
+        if f is not None:
+            frames.append(f)
+            pct = 58 + int((elapsed / PAN_FULL_TIME) * 25)
+            await prog(f"Balcony — frame {len(frames)}", pct)
+
+    await stop()
+    await asyncio.sleep(SETTLE_TIME)
+    f = await asyncio.to_thread(capture_frame)
+    if f is not None:
+        frames.append(f)
+
+    # ── Step 5: return home ───────────────────────────────────────────────────
+    await prog("Returning camera to home position…", 88)
+    await go_home()
+
+    await prog(f"Capture complete — {len(frames)} frames", 92)
+    logger.info(f"auto_scan finished: {len(frames)} frames captured")
+    return frames
