@@ -1,6 +1,6 @@
 # Lakeshore Church — Attendance Counter
 
-Auto-counts congregation via PTZ camera + YOLOv8n AI, with a mobile-responsive web UI showing a seat map, stitched panorama photo, attendance graphs, and full scan history.
+Auto-counts congregation via PTZ camera + YOLO26x AI, with a mobile-responsive web UI showing a seat map, stitched panorama photo, attendance graphs, and full scan history.
 
 ## Quick Start
 
@@ -77,7 +77,7 @@ Edit `backend/camera.py` constants if your room requires different timing:
 
 1. Camera moves through 32 presets; frames captured continuously during movement
 2. Frames deduplicated and stitched into a panorama (OpenCV Stitcher, falls back to horizontal concat)
-3. Panorama split into a **6 × 4 tiled grid with 30% overlap** — tiles run through YOLOv8n in batches of up to 24
+3. Panorama split into a **6 × 4 tiled grid with 30% overlap** — tiles run through YOLO26x in batches of up to 24
 4. Cross-tile NMS deduplication (IOU threshold 0.30) removes double-counts at tile edges
 5. CLAHE + gamma correction applied to improve detection in low-light conditions
 6. Detections mapped to seat IDs via calibration points
@@ -98,7 +98,7 @@ Single Docker container
 │   ├── WebSocket (/ws)  — live scan progress broadcast
 │   └── Static SPA       — React + Vite frontend
 ├── APScheduler          — 3 weekly cron jobs (America/Chicago)
-├── YOLOv8n              — tiled person detection (CPU)
+├── YOLO26x              — tiled person detection (CPU)
 ├── OpenCV Stitcher      — panorama from captured frames
 └── SQLite (/data/church.db)
 ```
@@ -144,13 +144,13 @@ To check the current version, look at the bottom-right footer of the UI.
 
 ## Optional: OpenVINO Acceleration
 
-For 2–4× faster inference on Intel CPUs, export the YOLO model to OpenVINO format:
+For 2–4× faster inference on Intel CPUs, export the YOLO26x model to OpenVINO INT8 format:
 
 ```bash
 bash export_openvino.sh
 ```
 
-Then update the model path in `config.env`.
+This produces `./models/yolo26x_openvino_model/`. Then set `YOLO_MODEL=/models/yolo26x_openvino_model` in `docker-compose.yml`.
 
 ## Troubleshooting
 
@@ -159,7 +159,7 @@ Then update the model path in `config.env`.
 | Camera unreachable | Confirm Docker host network can ping 10.10.140.140; check `network_mode: bridge` in docker-compose.yml |
 | RTSP fails | Run `ffplay rtsp://10.10.140.140:554/1` from the host to verify stream |
 | Stitching fails | Check `docker logs church-attendance` — falls back to horizontal concat automatically |
-| YOLOv8 model not found | Container downloads `yolov8n.pt` on first run — needs internet access on first start |
+| YOLO26x model not found | Container downloads `yolo26x.pt` on first run — needs internet access on first start |
 | Seats not coloring | Open Calibration wizard and mark ≥4 point pairs |
 | Scan stuck / spinner won't stop | Wait >5 min for the "✕ Reset" button to appear, or restart the container |
 | Per-seat colours wrong after SVG change | Re-run calibration — point mappings are tied to SVG coordinates |
