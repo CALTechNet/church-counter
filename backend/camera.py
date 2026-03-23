@@ -1,91 +1,147 @@
 """
 PTZ Optics camera control for Lakeshore Church attendance scanner.
 Camera: 10.10.140.140, ceiling center-stage, looking out at congregation.
-Scan pattern: 50 presets (100-149) in a zigzag grid, left-to-right.
+Scan pattern: presets (100-131) in a zigzag grid, left-to-right.
 Captures frames continuously during camera movement for denser coverage.
+Uses VISCA over TCP (port 5678) for PTZ control.
 """
 import asyncio
 import logging
-import re
+import socket
 import time
 from typing import List, Optional, Callable, Awaitable
 
-import httpx
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 CAMERA_IP = "10.10.140.140"
-PTZ_BASE = f"http://{CAMERA_IP}/cgi-bin/ptzctrl.cgi"
+VISCA_PORT = 5678
 RTSP_URL = f"rtsp://{CAMERA_IP}:554/1"
 
-# ── Scan presets — zigzag grid 100–149 ───────────────────────────────────────
-SCAN_PRESETS = list(range(100, 132))  # 100, 101, 102, ... 149
+# ── Scan presets — zigzag grid 100–131 ───────────────────────────────────────
+SCAN_PRESETS = list(range(100, 132))
 
 HOME_PRESET = 0
 
 # ── Timing constants ──────────────────────────────────────────────────────────
-TRAVEL_TIME     = 1.5   # seconds camera takes to travel between adjacent presets
-SETTLE_TIME     = 0   # extra seconds to wait after travel before final capture
+TRAVEL_TIME      = 1.5   # seconds camera takes to travel between adjacent presets
+SETTLE_TIME      = 0     # extra seconds to wait after travel before final capture
 CAPTURE_INTERVAL = 0.25  # seconds between frame captures during movement
 
 
-# ── Low-level PTZ command ─────────────────────────────────────────────────────
-async def _ptz(action: str, s1: int = 0, s2: int = 0, timeout: float = 4.0):
-    url = f"{PTZ_BASE}?ptzcmd&{action}&{s1}&{s2}"
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            resp = await client.get(url)
-            logger.debug(f"PTZ {action} s1={s1} s2={s2} → {resp.status_code}")
-        except Exception as exc:
-            logger.warning(f"PTZ command failed ({action}): {exc}")
+# ── VISCA TCP helpers ─────────────────────────────────────────────────────────
+
+def _visca_connect() -> socket.socket:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(4.0)
+    s.connect((CAMERA_IP, VISCA_PORT))
+    return s
+
+
+def _visca_send(s: socket.socket, cmd: bytes, read_timeout: float = 2.0) -> bytes:
+    """Send a VISCA command and return the response bytes."""
+    s.sendall(cmd)
+    s.settimeout(read_timeout)
+    try:
+        return s.recv(64)
+    except socket.timeout:
+        return b''
+
+
+def _decode_visca_pos(data: bytes, offset: int) -> int:
+    """Decode 4 VISCA nibble bytes at offset into a signed 16-bit int."""
+    v = (
+        (data[offset]     & 0xF) << 12 |
+        (data[offset + 1] & 0xF) << 8  |
+        (data[offset + 2] & 0xF) << 4  |
+        (data[offset + 3] & 0xF)
+    )
+    return v - 0x10000 if v > 0x7FFF else v
 
 
 # ── Preset helper ─────────────────────────────────────────────────────────────
+
+def _call_preset_sync(preset: int):
+    """Call a VISCA preset recall command (blocking)."""
+    # VISCA: 8x 01 04 3F 02 pp FF  (preset recall)
+    cmd = bytes([0x81, 0x01, 0x04, 0x3F, 0x02, preset & 0xFF, 0xFF])
+    try:
+        s = _visca_connect()
+        _visca_send(s, cmd)
+        s.close()
+    except Exception as exc:
+        logger.warning(f"VISCA preset {preset} failed: {exc}")
+
+
 async def call_preset(preset: int):
-    """Call a saved preset — matches exact URL format the camera expects."""
-    url = f"{PTZ_BASE}?ptzcmd&poscall&{preset}"
-    async with httpx.AsyncClient(timeout=4.0) as client:
-        try:
-            resp = await client.get(url)
-            logger.debug(f"PTZ poscall preset={preset} → {resp.status_code}")
-        except Exception as exc:
-            logger.warning(f"Preset call failed (preset {preset}): {exc}")
+    """Call a saved VISCA preset."""
+    await asyncio.to_thread(_call_preset_sync, preset)
+    logger.debug(f"VISCA preset recall preset={preset}")
+
+
+# ── Home position ─────────────────────────────────────────────────────────────
+
+def _go_home_sync():
+    """Send VISCA Home command (blocking)."""
+    # VISCA: 81 01 06 04 FF  (pan/tilt home)
+    cmd = b'\x81\x01\x06\x04\xFF'
+    try:
+        s = _visca_connect()
+        _visca_send(s, cmd)
+        s.close()
+    except Exception as exc:
+        logger.warning(f"VISCA home failed: {exc}")
 
 
 async def go_home():
-    """Return camera to home preset after scanning."""
-    await call_preset(HOME_PRESET)
+    """Return camera to home position via VISCA."""
+    await asyncio.to_thread(_go_home_sync)
     await asyncio.sleep(1.0)
     logger.info("Camera returned to home position")
 
 
 # ── Position query ─────────────────────────────────────────────────────────────
-def _parse_var(text: str, name: str) -> Optional[int]:
-    m = re.search(rf"(?:var\s+)?{name}\s*[=:]\s*(-?\d+)", text)
-    return int(m.group(1)) if m else None
+
+def _get_position_sync() -> dict:
+    """Query pan/tilt/zoom via VISCA inquiry (blocking)."""
+    result = {"pan": None, "tilt": None, "zoom": None}
+    try:
+        s = _visca_connect()
+
+        # Pan/Tilt position inquiry: 81 09 06 12 FF
+        # Response: 90 50 0p 0q 0r 0s 0t 0u 0v 0w FF
+        s.sendall(b'\x81\x09\x06\x12\xFF')
+        time.sleep(0.1)
+        try:
+            data = s.recv(64)
+            if len(data) >= 11 and data[0] == 0x90 and data[1] == 0x50:
+                result["pan"]  = _decode_visca_pos(data, 2)
+                result["tilt"] = _decode_visca_pos(data, 6)
+        except socket.timeout:
+            pass
+
+        # Zoom position inquiry: 81 09 04 47 FF
+        # Response: 90 50 0p 0q 0r 0s FF
+        s.sendall(b'\x81\x09\x04\x47\xFF')
+        time.sleep(0.1)
+        try:
+            data = s.recv(64)
+            if len(data) >= 7 and data[0] == 0x90 and data[1] == 0x50:
+                result["zoom"] = _decode_visca_pos(data, 2) & 0xFFFF
+        except socket.timeout:
+            pass
+
+        s.close()
+    except Exception as exc:
+        logger.debug(f"get_position failed: {exc}")
+    return result
 
 
 async def get_position() -> dict:
-    """Query the camera's current pan/tilt/zoom position.
-
-    PTZ Optics cameras expose current position via param.cgi.
-    Returns a dict with keys pan, tilt, zoom (int or None on error).
-    """
-    url = f"http://{CAMERA_IP}/cgi-bin/param.cgi?get_pan_tilt_zoom"
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        try:
-            resp = await client.get(url)
-            text = resp.text
-            return {
-                "pan":  _parse_var(text, "pan"),
-                "tilt": _parse_var(text, "tilt"),
-                "zoom": _parse_var(text, "zoom"),
-            }
-        except Exception as exc:
-            logger.debug(f"get_position failed: {exc}")
-            return {"pan": None, "tilt": None, "zoom": None}
+    """Query the camera's current pan/tilt/zoom position via VISCA."""
+    return await asyncio.to_thread(_get_position_sync)
 
 
 # ── Frame capture ─────────────────────────────────────────────────────────────
