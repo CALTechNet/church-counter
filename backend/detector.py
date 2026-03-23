@@ -30,7 +30,7 @@ _model = None
 # ── Tiling config ─────────────────────────────────────────────────────────────
 TILE_COLS    = 6     # number of columns to split panorama into
 TILE_ROWS    = 4     # number of rows
-TILE_OVERLAP = 0.30  # 30% overlap between tiles to avoid missing edge detections
+TILE_OVERLAP = 0.50  # 50% overlap between tiles to avoid missing edge detections
 NMS_IOU      = 0.30  # IOU threshold for cross-tile deduplication
 
 # Max tiles per YOLO batch call. Reduce if you hit memory pressure (min 1).
@@ -93,7 +93,7 @@ def _nms_detections(detections: List[Dict], iou_threshold: float = NMS_IOU) -> L
 
 
 # ── Tiled detection ────────────────────────────────────────────────────────────
-def detect_people(image: np.ndarray, confidence: float = 0.15) -> List[Dict]:
+def detect_people(image: np.ndarray, confidence: float = float(os.getenv("YOLO_CONFIDENCE", "0.30"))) -> List[Dict]:
     """
     Run YOLO26x on image using batched tiled inference.
     Splits the panorama into a TILE_COLS x TILE_ROWS grid with TILE_OVERLAP overlap.

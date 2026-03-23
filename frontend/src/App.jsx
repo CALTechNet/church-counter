@@ -31,6 +31,7 @@ export default function App() {
   const [latestTs, setLatestTs]   = useState(null)
   const [latestService, setLatestService] = useState(null)
   const [imageB64, setImageB64]       = useState(null)
+  const [rawImageB64, setRawImageB64] = useState(null)
   const [scanStartedAt, setScanStartedAt] = useState(null)
   const [zoomImageB64, setZoomImageB64] = useState(null)
   const [serviceType, setServiceType] = useState('Manual')
@@ -73,6 +74,7 @@ export default function App() {
           setLatestTs(msg.timestamp)
           setLatestService(msg.service_type)
           setImageB64(msg.image_b64)
+          setRawImageB64(msg.raw_image_b64 ?? null)
           setZoomImageB64(msg.zoom_image_b64)
           showToast(`Scan complete — ${msg.count} people detected`)
         } else if (msg.type === 'scan_error') {
@@ -86,6 +88,7 @@ export default function App() {
           setLatestTs(msg.latest_timestamp)
           setLatestService(msg.latest_service)
           setImageB64(msg.latest_image_b64)
+          setRawImageB64(msg.latest_raw_image_b64 ?? null)
           setZoomImageB64(msg.latest_zoom_image_b64)
         }
       })
@@ -208,7 +211,7 @@ export default function App() {
 
       {/* Content */}
       <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-        {tab === 0 && <PhotoView imageB64={imageB64} zoomImageB64={zoomImageB64} scanning={scanState.running} />}
+        {tab === 0 && <PhotoView imageB64={imageB64} rawImageB64={rawImageB64} zoomImageB64={zoomImageB64} scanning={scanState.running} />}
         {tab === 1 && <AttendanceGraph />}
         {tab === 2 && <DataTable />}
       </main>
