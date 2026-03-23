@@ -324,6 +324,15 @@ async def api_capture():
     return {"image_b64": stitch.to_base64(frame, quality=90)}
 
 
+# ── Live frame — lower quality for fast polling ───────────────────────────────
+@app.get("/api/live-frame")
+async def api_live_frame():
+    frame = await asyncio.to_thread(cam.capture_frame)
+    if frame is None:
+        raise HTTPException(503, "Could not capture frame from camera")
+    return {"image_b64": stitch.to_base64(frame, quality=65)}
+
+
 # ── Manual PTZ control ────────────────────────────────────────────────────────
 PTZ_ACTIONS = {
     "left":     lambda s: cam.pan_left(s),

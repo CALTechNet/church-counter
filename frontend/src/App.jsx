@@ -2,12 +2,13 @@ import { useState, useEffect, useCallback } from 'react'
 import PhotoView from './components/PhotoView.jsx'
 import AttendanceGraph from './components/AttendanceGraph.jsx'
 import DataTable from './components/DataTable.jsx'
+import LiveView from './components/LiveView.jsx'
 import CalibrationWizard from './components/CalibrationWizard.jsx'
 import { getStatus, triggerScan, createWebSocket, getPtzPosition } from './api.js'
 import { VERSION } from './version.js'
 import { useIsMobile } from './hooks/useIsMobile.js'
 
-const TABS = ['Photo', 'Attendance', 'Data']
+const TABS = ['Photo', 'Attendance', 'Data', 'Live View']
 const SERVICE_TYPES = ['Manual', 'Sunday Morning', 'Sunday Midday', 'Wednesday Evening']
 
 const C = {
@@ -233,6 +234,7 @@ export default function App() {
         {tab === 0 && <PhotoView imageB64={imageB64} rawImageB64={rawImageB64} zoomImageB64={zoomImageB64} scanning={scanState.running} />}
         {tab === 1 && <AttendanceGraph />}
         {tab === 2 && <DataTable />}
+        {tab === 3 && <LiveView scanning={scanState.running} ptzPos={ptzPos} />}
       </main>
 
       {/* Calibration modal */}
