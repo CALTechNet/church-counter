@@ -21,6 +21,7 @@ export async function clearCalibration() {
 export async function ptzCommand(action, speed = 10) {
   return _post(`/api/ptz/${action}?speed=${speed}`)
 }
+export async function getPtzPosition() { return _get('/api/ptz/position') }
 
 async function _get(path) {
   const r = await fetch(BASE + path)

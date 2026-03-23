@@ -3,7 +3,7 @@ import PhotoView from './components/PhotoView.jsx'
 import AttendanceGraph from './components/AttendanceGraph.jsx'
 import DataTable from './components/DataTable.jsx'
 import CalibrationWizard from './components/CalibrationWizard.jsx'
-import { getStatus, triggerScan, createWebSocket } from './api.js'
+import { getStatus, triggerScan, createWebSocket, getPtzPosition } from './api.js'
 import { VERSION } from './version.js'
 import { useIsMobile } from './hooks/useIsMobile.js'
 
@@ -38,6 +38,7 @@ export default function App() {
   const [showCal, setShowCal]     = useState(false)
   const [hasCalibration, setHasCalibration] = useState(false)
   const [toast, setToast]         = useState(null)
+  const [ptzPos, setPtzPos]       = useState(null)
 
   const showToast = (msg, color = C.green) => {
     setToast({ msg, color })
@@ -98,6 +99,14 @@ export default function App() {
     return () => ws && ws.close()
   }, [])
 
+  // PTZ position polling — every second
+  useEffect(() => {
+    const poll = () => getPtzPosition().then(setPtzPos).catch(() => {})
+    poll()
+    const id = setInterval(poll, 1000)
+    return () => clearInterval(id)
+  }, [])
+
   const handleScan = async () => {
     try {
       await triggerScan(serviceType)
@@ -124,6 +133,16 @@ export default function App() {
           <span style={{ fontSize: isMobile ? 18 : 22, fontWeight: 700, letterSpacing: '-0.5px', whiteSpace: 'nowrap' }}>⛪ Lakeshore Church</span>
           {!isMobile && <span style={{ color: C.muted, fontSize: 14 }}>Attendance Counter</span>}
         </div>
+
+        {/* PTZ position status */}
+        {!isMobile && ptzPos && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, color: C.muted, fontFamily: 'monospace', background: C.bg, borderRadius: 6, padding: '4px 10px', border: `1px solid ${C.border}` }}>
+            <span style={{ color: C.border, fontSize: 10, fontFamily: 'system-ui', letterSpacing: '0.05em', textTransform: 'uppercase', marginRight: 2 }}>PTZ</span>
+            <span>X: {ptzPos.pan  ?? '--'}</span>
+            <span>Y: {ptzPos.tilt ?? '--'}</span>
+            <span>Z: {ptzPos.zoom ?? '--'}</span>
+          </div>
+        )}
 
         {/* Latest count — inline on mobile, right-aligned on desktop */}
         {latestCount !== null && (
