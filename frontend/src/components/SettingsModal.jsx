@@ -64,7 +64,7 @@ export default function SettingsModal({ onClose, onSave }) {
     const br = bounds?.bottom_right
     if (!tl || !br) return null
     const zoom     = Math.max(1, bounds?.zoom || tl?.zoom || 10000)
-    const step     = Math.max(1, Math.floor(75 * 10000 / zoom))
+    const step     = Math.max(1, Math.floor(150 * 10000 / zoom))
     const cols     = Math.max(1, Math.ceil(Math.abs(br.pan  - tl.pan)  / step) + 1)
     const rows     = Math.max(1, Math.ceil(Math.abs(br.tilt - tl.tilt) / step) + 1)
     return { cols, rows, total: cols * rows, zoom, step }
