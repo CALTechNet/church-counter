@@ -57,8 +57,7 @@ export default function CalibrationWizard({ onClose }) {
       } catch (e) {
         if (liveRunning.current) setFrameError(e.message)
       }
-      // No setTimeout — loop immediately for maximum live feel
-      if (liveRunning.current) requestAnimationFrame(fetchFrame)
+      if (liveRunning.current) setTimeout(fetchFrame, 100)
     }
 
     fetchFrame()
@@ -94,6 +93,35 @@ export default function CalibrationWizard({ onClose }) {
   const sendPtz  = useCallback((action, speed = 8) => ptzCommand(action, speed).catch(() => {}), [])
   const stopPan  = useCallback(() => ptzCommand('stop').catch(() => {}), [])
   const stopZoom = useCallback(() => ptzCommand('zoomstop').catch(() => {}), [])
+
+  // Arrow key PTZ control (slow speed for precision)
+  useEffect(() => {
+    const pressed = new Set()
+    const KEY_ACTION = {
+      ArrowUp:    'up',
+      ArrowDown:  'down',
+      ArrowLeft:  'left',
+      ArrowRight: 'right',
+    }
+    const onKeyDown = (e) => {
+      const action = KEY_ACTION[e.key]
+      if (!action || pressed.has(e.key)) return
+      e.preventDefault()
+      pressed.add(e.key)
+      ptzCommand(action, 3).catch(() => {})
+    }
+    const onKeyUp = (e) => {
+      if (!KEY_ACTION[e.key]) return
+      pressed.delete(e.key)
+      if (pressed.size === 0) ptzCommand('stop').catch(() => {})
+    }
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+    }
+  }, [])
 
   // ── Bounds capture ────────────────────────────────────────────────────────
   const captureTopLeft = () => {
