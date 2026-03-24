@@ -80,6 +80,7 @@ async def run_scan(service_type: str = "Manual"):
 
     _scan_cancel.clear()
     state["running"] = True
+    live_was_running = False
     await _broadcast({"type": "scan_started", "service_type": service_type})
 
     try:
@@ -94,6 +95,12 @@ async def run_scan(service_type: str = "Manual"):
             raise _ScanCancelledError()
         if not frames:
             raise RuntimeError("Camera returned 0 frames")
+
+        # Pause live view during processing to free up resources
+        live_was_running = cam._live_thread is not None and cam._live_thread.is_alive()
+        if live_was_running:
+            cam.stop_live_capture()
+            logger.info("Live view paused for YOLO processing")
 
         # 2. Stitch
         await _progress("Stitching panorama…", 93)
@@ -166,6 +173,9 @@ async def run_scan(service_type: str = "Manual"):
         await _broadcast({"type": "scan_error", "error": str(exc)})
     finally:
         state["running"] = False
+        if live_was_running:
+            cam.start_live_capture()
+            logger.info("Live view resumed")
 
 
 def _svg_viewbox():
