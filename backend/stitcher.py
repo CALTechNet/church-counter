@@ -74,8 +74,18 @@ def stitch_frames(
 
     if grid_shape is not None:
         rows, cols = grid_shape
-        if len(frames) == rows * cols:
-            return _stitch_grid(frames, rows, cols)
+        if len(frames) >= rows * cols:
+            # Use exactly rows*cols frames (ignore any extras)
+            return _stitch_grid(frames[: rows * cols], rows, cols)
+        if len(frames) >= cols:
+            # Fewer frames than expected — reduce rows to fit
+            actual_rows = len(frames) // cols
+            if actual_rows >= 1:
+                logger.warning(
+                    f"Grid expects {rows}×{cols}={rows*cols} frames but got "
+                    f"{len(frames)} — using {actual_rows}×{cols} instead"
+                )
+                return _stitch_grid(frames[: actual_rows * cols], actual_rows, cols)
         logger.warning(
             f"Grid expects {rows}×{cols}={rows*cols} frames but got "
             f"{len(frames)} — falling back to sequential stitch"

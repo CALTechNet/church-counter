@@ -413,7 +413,8 @@ async def _preset_scan(
     progress_callback: Optional[ProgressCB] = None,
     cancel_event=None,
     camera_ip: str = None,
-) -> List[np.ndarray]:
+    preset_cols: int = None,
+) -> Tuple[List[np.ndarray], Optional[Tuple[int, int]]]:
     """Visit a list of VISCA presets, capturing one frame immediately after each move.
     Navigates to the first preset and waits 1.5s to settle before scanning.
     If preset positions have been learned (via learn_preset_positions), uses
@@ -445,10 +446,17 @@ async def _preset_scan(
         else:
             await call_preset(preset_id)
 
+    # Compute grid shape when preset_cols is configured
+    grid_shape: Optional[Tuple[int, int]] = None
+    if preset_cols and preset_cols > 0 and total >= preset_cols:
+        rows = math.ceil(total / preset_cols)
+        grid_shape = (rows, preset_cols)
+        logger.info(f"Preset scan: grid mode {rows} rows × {preset_cols} cols")
+
     await prog("Starting preset scan…", 0)
 
     if not presets:
-        return frames
+        return frames, grid_shape
 
     # Go to first preset and wait for camera to settle
     await prog(f"Moving to first preset {presets[0]}…", 0)
@@ -456,7 +464,7 @@ async def _preset_scan(
     await asyncio.sleep(3.0)
 
     if cancelled():
-        return frames
+        return frames, grid_shape
 
     # Capture frames during the settle window at first preset
     f = await asyncio.to_thread(capture_frame)
@@ -467,7 +475,7 @@ async def _preset_scan(
     # Move through remaining presets; wait 25ms after each move, then capture
     for i, preset_id in enumerate(presets[1:], 1):
         if cancelled():
-            return frames
+            return frames, grid_shape
         pct = int((i / total) * 88)
         await goto_preset(preset_id)
         await asyncio.sleep(0.025)
@@ -486,7 +494,7 @@ async def _preset_scan(
     await go_home()
     await prog(f"Capture complete — {len(frames)} frames", 92)
     logger.info(f"_preset_scan done: {len(frames)} frames across {total} presets")
-    return frames
+    return frames, grid_shape
 
 
 async def _calibrated_scan(
@@ -662,13 +670,15 @@ async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event
             preset_start = int(room_config.get("preset_start", 100))
             preset_end   = int(room_config.get("preset_end", 131))
             presets = list(range(preset_start, preset_end + 1))
-            frames = await _preset_scan(
+            p_cols = room_config.get("preset_cols")
+            p_cols = int(p_cols) if p_cols else None
+            return await _preset_scan(
                 presets,
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 camera_ip=room_config.get("camera_ip"),
+                preset_cols=p_cols,
             )
-            return frames, None
 
     # Fallback: use global settings (backward compat)
     settings = db.get_config("app_settings", {})
@@ -680,5 +690,6 @@ async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event
         preset_start = int(settings.get("preset_start", 100))
         preset_end   = int(settings.get("preset_end",   131))
         presets = list(range(preset_start, preset_end + 1))
-        frames = await _preset_scan(presets, progress_callback=progress_callback, cancel_event=cancel_event)
-        return frames, None
+        p_cols = settings.get("preset_cols")
+        p_cols = int(p_cols) if p_cols else None
+        return await _preset_scan(presets, progress_callback=progress_callback, cancel_event=cancel_event, preset_cols=p_cols)
