@@ -367,6 +367,7 @@ ProgressCB = Callable[[str, int], Awaitable[None]]
 async def _preset_scan(
     presets: List[int],
     progress_callback: Optional[ProgressCB] = None,
+    cancel_event=None,
 ) -> List[np.ndarray]:
     """Visit a list of VISCA presets, capturing one frame immediately after each move.
     Navigates to the first preset and waits 1.5s to settle before scanning."""
@@ -378,6 +379,9 @@ async def _preset_scan(
         if progress_callback:
             await progress_callback(msg, pct)
 
+    def cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     await prog("Starting preset scan…", 0)
 
     if not presets:
@@ -388,6 +392,9 @@ async def _preset_scan(
     await call_preset(presets[0])
     await asyncio.sleep(1.5)
 
+    if cancelled():
+        return frames
+
     # Capture frames during the settle window at first preset
     f = await asyncio.to_thread(capture_frame)
     if f is not None:
@@ -396,6 +403,8 @@ async def _preset_scan(
 
     # Move through remaining presets; capture one frame after each move
     for i, preset_id in enumerate(presets[1:], 1):
+        if cancelled():
+            return frames
         pct = int((i / total) * 88)
         await call_preset(preset_id)
         f = await asyncio.to_thread(capture_frame)
@@ -418,6 +427,7 @@ async def _preset_scan(
 
 async def _calibrated_scan(
     progress_callback: Optional[ProgressCB] = None,
+    cancel_event=None,
 ) -> List[np.ndarray]:
     """
     Move camera through a grid of absolute PTZ positions between the saved
@@ -466,6 +476,9 @@ async def _calibrated_scan(
         if progress_callback:
             await progress_callback(msg, pct)
 
+    def cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     await prog(f"Starting calibrated scan ({rows}×{cols} grid, {total} positions)…", 0)
 
     if not positions:
@@ -477,6 +490,9 @@ async def _calibrated_scan(
     await move_abs(pan0, tilt0)
     await asyncio.sleep(1.5)
 
+    if cancelled():
+        return frames
+
     # Capture frames during the settle window at top-left
     f = await asyncio.to_thread(capture_frame)
     if f is not None:
@@ -485,6 +501,8 @@ async def _calibrated_scan(
 
     # Move through remaining positions; capture one frame after each move
     for i, (pan, tilt) in enumerate(positions[1:], 1):
+        if cancelled():
+            return frames
         pct = int((i / total) * 88)
         await move_abs(pan, tilt)
         f = await asyncio.to_thread(capture_frame)
@@ -505,7 +523,7 @@ async def _calibrated_scan(
     return frames
 
 
-async def auto_scan(progress_callback: Optional[ProgressCB] = None) -> List[np.ndarray]:
+async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event=None) -> List[np.ndarray]:
     """
     Dispatch to either preset or calibrated scan based on saved app settings.
     """
@@ -514,9 +532,9 @@ async def auto_scan(progress_callback: Optional[ProgressCB] = None) -> List[np.n
     mode = settings.get("scan_mode", "preset")
 
     if mode == "calibrated":
-        return await _calibrated_scan(progress_callback=progress_callback)
+        return await _calibrated_scan(progress_callback=progress_callback, cancel_event=cancel_event)
     else:
         preset_start = int(settings.get("preset_start", 100))
         preset_end   = int(settings.get("preset_end",   131))
         presets = list(range(preset_start, preset_end + 1))
-        return await _preset_scan(presets, progress_callback=progress_callback)
+        return await _preset_scan(presets, progress_callback=progress_callback, cancel_event=cancel_event)
