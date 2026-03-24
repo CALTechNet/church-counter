@@ -451,8 +451,8 @@ async def _calibrated_scan(
     zoom = int(bounds.get("zoom") or tl.get("zoom") or 10000)
     zoom = max(1, zoom)
 
-    # At zoom=10000 each photo covers ~25 pan units; vertical step is fixed at 50
-    pan_step  = max(1, int(25 * 10000 / zoom))
+    # At zoom=10000 each photo covers ~40 pan units; vertical step is fixed at 50
+    pan_step  = max(1, int(40 * 10000 / zoom))
     tilt_step = 50
     pan_range  = abs(pan_br  - pan_tl)
     tilt_range = abs(tilt_br - tilt_tl)
