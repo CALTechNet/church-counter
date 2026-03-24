@@ -52,8 +52,8 @@ SETTLE_TIME      = 0     # extra seconds to wait after travel before final captu
 CAPTURE_INTERVAL = 0.25  # seconds between frame captures during movement
 
 # ── Position verification constants ──────────────────────────────────────────
-POS_TOLERANCE    = 5     # pan/tilt units — positions within this are "arrived"
-POS_POLL_INTERVAL = 0.15 # seconds between position polls
+POS_TOLERANCE    = 10    # pan/tilt units — positions within this are "arrived"
+POS_POLL_INTERVAL = 0.05 # seconds between position polls
 POS_TIMEOUT      = 4.0   # seconds to wait for camera to reach target before retry
 POS_MAX_RETRIES  = 2     # number of times to resend move command if stuck
 
@@ -684,7 +684,7 @@ async def _calibrated_scan(
         lambda: move_abs(pan0, tilt0),
     )
     # Brief settle for vibration damping
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.075)
 
     if cancelled():
         return frames
