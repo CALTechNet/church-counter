@@ -532,16 +532,21 @@ async def _calibrated_scan(
     #   zoom=10000 → step=75,  zoom=5000 → step=200
     # Fitting step = a/zoom + b gives a=1_250_000, b=-50
     # i.e.  step = 1_250_000 / zoom - 50  (minimum 25)
+    #
+    # Tilt step is 65% of pan step: ceiling-mounted cameras see more
+    # perspective distortion per degree of tilt than pan, so we need
+    # denser vertical overlap to prevent the stitcher from scaling
+    # frames to match features across tilt transitions.
     pan_step  = max(25, int(1_250_000 / zoom) - 50)
-    tilt_step = max(25, int(1_250_000 / zoom) - 50)
+    tilt_step = max(25, int(pan_step * 0.65))
     pan_range  = abs(pan_br  - pan_tl)
     tilt_range = abs(tilt_br - tilt_tl)
     cols = max(1, math.ceil(pan_range  / pan_step)  + 1)
     rows = max(1, math.ceil(tilt_range / tilt_step) + 1)
 
     logger.info(
-        f"Grid: zoom={zoom} → step={pan_step}, {cols} cols × {rows} rows "
-        f"({cols * rows} positions)"
+        f"Grid: zoom={zoom} → pan_step={pan_step}, tilt_step={tilt_step}, "
+        f"{cols} cols × {rows} rows ({cols * rows} positions)"
     )
 
     # Build position list in a vertical-S (column-major boustrophedon) pattern:
