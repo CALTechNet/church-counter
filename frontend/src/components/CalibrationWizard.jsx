@@ -38,9 +38,12 @@ export default function CalibrationWizard({ onClose }) {
   const liveRunning   = useRef(false)
   const posInterval   = useRef(null)
 
-  // ── Live feed — continuous poll, no delay between frames ─────────────────
+  // ── Live feed — 10 fps polling against persistent backend stream ─────────
   useEffect(() => {
     liveRunning.current = true
+
+    // Tell the backend to open the persistent RTSP capture thread
+    fetch('/api/live-frame/start', { method: 'POST' }).catch(() => {})
 
     const fetchFrame = async () => {
       if (!liveRunning.current) return
@@ -57,11 +60,16 @@ export default function CalibrationWizard({ onClose }) {
       } catch (e) {
         if (liveRunning.current) setFrameError(e.message)
       }
+      // Target 10 fps: schedule next fetch 100 ms from now
       if (liveRunning.current) setTimeout(fetchFrame, 100)
     }
 
     fetchFrame()
-    return () => { liveRunning.current = false }
+    return () => {
+      liveRunning.current = false
+      // Release the persistent stream when the wizard closes
+      fetch('/api/live-frame/stop', { method: 'POST' }).catch(() => {})
+    }
   }, [])
 
   // ── PTZ position poll ─────────────────────────────────────────────────────
