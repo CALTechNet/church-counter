@@ -11,9 +11,10 @@ Batching fix: frames are split into small batches before stitching
 to prevent OpenCV's bundle adjuster from consuming excessive memory
 and crashing the machine.
 
-Memory fix: frames are downscaled to STITCH_MAX_WIDTH before stitching
-and released batch-by-batch so a large calibrated scan (80+ frames) does
-not exhaust RAM before the first batch even starts.
+Memory fix: waiting frames are JPEG-compressed in memory (~600 KB each
+vs ~6 MB raw) so 76 frames occupy ~45 MB instead of ~456 MB while
+batches are processed. Only the active batch is decompressed to full-res
+numpy arrays, so stitching quality and output resolution are unchanged.
 """
 import base64
 import gc
@@ -27,8 +28,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 6        # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
-STITCH_MAX_WIDTH = 960  # downscale wider frames before stitching to cap RAM usage
+BATCH_SIZE = 6  # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
 
 
 def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
@@ -44,15 +44,6 @@ def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
     # Gamma 2.0 lift
     lut = np.array([((i / 255.0) ** (1.0 / 2.0)) * 255 for i in range(256)], dtype=np.uint8)
     return cv2.LUT(enhanced, lut)
-
-
-def _downscale_for_stitch(frame: np.ndarray) -> np.ndarray:
-    """Downscale frame to STITCH_MAX_WIDTH if wider, preserving aspect ratio."""
-    h, w = frame.shape[:2]
-    if w <= STITCH_MAX_WIDTH:
-        return frame
-    new_h = int(h * STITCH_MAX_WIDTH / w)
-    return cv2.resize(frame, (STITCH_MAX_WIDTH, new_h), interpolation=cv2.INTER_AREA)
 
 
 def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
@@ -72,20 +63,26 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     unique = _deduplicate(frames)
     logger.info(f"Stitching {len(unique)} unique frames (from {len(frames)} captured)")
 
-    # Downscale frames to cap per-frame RAM (e.g. 1080p → 960px wide = ~4× less memory)
-    unique = [_downscale_for_stitch(f) for f in unique]
-
     if len(unique) <= BATCH_SIZE:
         return _stitch_batch(unique)
 
-    # Split into batches and stitch each, releasing originals as we go
+    # JPEG-compress waiting frames so 76×~6 MB raw → 76×~600 KB in memory.
+    # Only the active batch is decompressed to full-res arrays; output resolution
+    # is unchanged because the stitcher always receives original-quality frames.
     n_batches = math.ceil(len(unique) / BATCH_SIZE)
     logger.info(f"Stitching in {n_batches} batches of up to {BATCH_SIZE} frames")
+    compressed = [cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+                  for f in unique]
+    del unique
+    gc.collect()
 
     batch_panoramas: List[np.ndarray] = []
     batch_num = 0
-    while unique:
-        batch, unique = unique[:BATCH_SIZE], unique[BATCH_SIZE:]
+    while compressed:
+        batch_compressed, compressed = compressed[:BATCH_SIZE], compressed[BATCH_SIZE:]
+        batch = [cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
+                 for b in batch_compressed]
+        del batch_compressed
         batch_num += 1
         logger.info(f"Stitching batch {batch_num}/{n_batches} ({len(batch)} frames)…")
         pano, _status = _stitch_batch(batch)
