@@ -300,13 +300,106 @@ def _match_pair(
 # Canvas compositing with affine warping and blending
 # ---------------------------------------------------------------------------
 
+def _compute_gain_compensation(
+    frames: List[np.ndarray],
+    transforms: List[np.ndarray],
+    canvas_w: int,
+    canvas_h: int,
+    T: np.ndarray,
+) -> np.ndarray:
+    """Compute per-frame gain factors so overlapping regions have matched brightness.
+
+    For each pair of overlapping frames we measure the mean intensity ratio in
+    the overlap zone and solve a least-squares system to find a single scalar
+    gain per frame that minimises brightness differences across all overlaps.
+    Returns an array of shape (n_frames,) with gain multipliers.
+    """
+    n = len(frames)
+    if n <= 1:
+        return np.ones(n, dtype=np.float64)
+
+    # Build small masks (quarter-res) for speed
+    scale = 0.25
+    sw = max(1, int(canvas_w * scale))
+    sh = max(1, int(canvas_h * scale))
+    S = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]], dtype=np.float64)
+
+    gray_warped = []
+    masks = []
+    kernel = np.ones((3, 3), np.uint8)
+
+    for frame, H in zip(frames, transforms):
+        H_final = S @ T @ H
+        A_final = H_final[:2, :]
+
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        w_g = cv2.warpAffine(g, A_final, (sw, sh),
+                             flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        m = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+        w_m = cv2.warpAffine(m, A_final, (sw, sh),
+                             flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        valid = (w_m > 128).astype(np.uint8)
+        valid = cv2.erode(valid, kernel, iterations=1)
+
+        gray_warped.append(w_g.astype(np.float64))
+        masks.append(valid)
+
+    # Build equations: for each overlapping pair, gain[i]*mean_i ≈ gain[j]*mean_j
+    # We solve via least-squares with the constraint that mean gain = 1.
+    A_rows = []
+    b_rows = []
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            overlap = masks[i] & masks[j]
+            count = int(overlap.sum())
+            if count < 100:
+                continue
+            mean_i = gray_warped[i][overlap > 0].mean()
+            mean_j = gray_warped[j][overlap > 0].mean()
+            if mean_i < 1 or mean_j < 1:
+                continue
+            # We want gain[i]*mean_i = gain[j]*mean_j
+            # => gain[i]*mean_i - gain[j]*mean_j = 0
+            row = np.zeros(n, dtype=np.float64)
+            row[i] = mean_i
+            row[j] = -mean_j
+            A_rows.append(row)
+            b_rows.append(0.0)
+
+    if not A_rows:
+        return np.ones(n, dtype=np.float64)
+
+    # Add soft constraint: sum(gain) = n (mean gain = 1)
+    constraint = np.ones(n, dtype=np.float64)
+    A_rows.append(constraint * 10.0)  # high weight
+    b_rows.append(n * 10.0)
+
+    A_mat = np.array(A_rows)
+    b_vec = np.array(b_rows)
+
+    gains, _, _, _ = np.linalg.lstsq(A_mat, b_vec, rcond=None)
+
+    # Clamp to reasonable range
+    gains = np.clip(gains, 0.5, 2.0)
+    # Renormalize so mean is 1
+    gains /= gains.mean()
+
+    logger.info(f"Gain compensation: min={gains.min():.3f} max={gains.max():.3f}")
+    return gains
+
+
 def _composite_affine(
     frames: List[np.ndarray],
     transforms: List[np.ndarray],
 ) -> np.ndarray:
     """
     Warp every frame using its accumulated affine transform and blend onto a
-    single canvas.  Uses distance-transform weights for seamless seams.
+    single canvas.  Uses gain compensation to match brightness across frames
+    and power-weighted distance-transform blending for seamless seams.
     """
     all_corners = []
     for frame, H in zip(frames, transforms):
@@ -339,6 +432,9 @@ def _composite_affine(
 
     logger.info(f"Canvas size: {canvas_w} x {canvas_h}")
 
+    # Compute per-frame gain compensation to match brightness across frames
+    gains = _compute_gain_compensation(frames, transforms, canvas_w, canvas_h, T)
+
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
     weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
 
@@ -353,6 +449,9 @@ def _composite_affine(
             borderValue=(0, 0, 0),
         )
 
+        # Apply gain compensation
+        warped = np.clip(warped.astype(np.float32) * gains[i], 0, 255).astype(np.uint8)
+
         frame_mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
         warped_mask = cv2.warpAffine(
             frame_mask, A_final, (canvas_w, canvas_h),
@@ -362,10 +461,16 @@ def _composite_affine(
         )
         valid = (warped_mask > 128).astype(np.uint8)
 
-        kernel = np.ones((3, 3), np.uint8)
-        valid = cv2.erode(valid, kernel, iterations=2)
+        # Larger erosion to remove edge artifacts and vignetting
+        kernel = np.ones((5, 5), np.uint8)
+        valid = cv2.erode(valid, kernel, iterations=4)
 
         dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5)
+
+        # Power-weight the distance so centre pixels dominate more strongly;
+        # this makes the transition zone narrower and hides residual brightness
+        # differences better than linear weighting.
+        dist = np.power(dist, 2.0)
 
         canvas += warped.astype(np.float32) * dist[:, :, None]
         weight += dist
