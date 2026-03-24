@@ -103,6 +103,10 @@ def detect_people(image: np.ndarray, confidence: float = 0.10) -> List[Dict]:
     Returns list of unique person detections in full image coordinates.
     """
     model    = _get_model()
+    h_orig, w_orig = image.shape[:2]
+    logger.info(f"Starting detection — image {w_orig}x{h_orig}, "
+                f"grid {TILE_COLS}x{TILE_ROWS}, conf≥{confidence}")
+
     enhanced = enhance_image(image)
     h, w     = enhanced.shape[:2]
 
@@ -127,8 +131,9 @@ def detect_people(image: np.ndarray, confidence: float = 0.10) -> List[Dict]:
             tiles.append(tile)
             offsets.append((x_start, y_start))
 
+    n_batches = math.ceil(len(tiles) / TILE_BATCH_SIZE)
     logger.info(f"Running batched inference on {len(tiles)} tiles "
-                f"(batch size {TILE_BATCH_SIZE})")
+                f"(batch size {TILE_BATCH_SIZE}, {n_batches} batch{'es' if n_batches != 1 else ''})")
 
     # ── Batched YOLO inference ─────────────────────────────────────────────────
     all_detections: List[Dict] = []
@@ -136,6 +141,9 @@ def detect_people(image: np.ndarray, confidence: float = 0.10) -> List[Dict]:
     for batch_start in range(0, len(tiles), TILE_BATCH_SIZE):
         batch_tiles   = tiles  [batch_start : batch_start + TILE_BATCH_SIZE]
         batch_offsets = offsets[batch_start : batch_start + TILE_BATCH_SIZE]
+        batch_num     = batch_start // TILE_BATCH_SIZE + 1
+        logger.info(f"  Batch {batch_num}/{n_batches}: "
+                    f"tiles {batch_start + 1}–{batch_start + len(batch_tiles)}")
 
         results = model(
             batch_tiles,
@@ -145,6 +153,7 @@ def detect_people(image: np.ndarray, confidence: float = 0.10) -> List[Dict]:
             verbose=False,
         )
 
+        batch_hits = 0
         for result, (x_start, y_start) in zip(results, batch_offsets):
             for box in result.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -158,13 +167,21 @@ def detect_people(image: np.ndarray, confidence: float = 0.10) -> List[Dict]:
                     "cy":         (y1 + y2) // 2 + y_start,
                     "confidence": round(conf, 3),
                 })
+                batch_hits += 1
+        logger.info(f"  Batch {batch_num}/{n_batches}: {batch_hits} raw detections")
 
-    logger.info(f"Batched detection: {len(all_detections)} raw detections "
-                f"across {len(tiles)} tiles")
+    if all_detections:
+        confs = [d["confidence"] for d in all_detections]
+        logger.info(f"Batched detection: {len(all_detections)} raw detections across "
+                    f"{len(tiles)} tiles (conf min={min(confs):.2f} avg={sum(confs)/len(confs):.2f} max={max(confs):.2f})")
+    else:
+        logger.info(f"Batched detection: 0 raw detections across {len(tiles)} tiles")
 
     # ── Cross-tile deduplication ───────────────────────────────────────────────
     detections = _nms_detections(all_detections)
-    logger.info(f"After cross-tile NMS: {len(detections)} unique people detected")
+    dupes = len(all_detections) - len(detections)
+    logger.info(f"After cross-tile NMS: {len(detections)} unique people "
+                f"({dupes} duplicate{'s' if dupes != 1 else ''} removed)")
     return detections
 
 
