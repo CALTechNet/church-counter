@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { ptzCommand, gotoBound, getCameraBounds } from '../api.js'
 import { useIsMobile } from '../hooks/useIsMobile.js'
 
@@ -12,6 +12,8 @@ const C = {
   green:   '#22c55e',
   red:     '#ef4444',
   yellow:  '#eab308',
+  purple:  '#a855f7',
+  orange:  '#f97316',
 }
 
 export default function LiveView({ scanning, ptzPos }) {
@@ -56,7 +58,20 @@ export default function LiveView({ scanning, ptzPos }) {
     return () => { running = false }
   }, [])
 
-  const sendPtz = (action, speed = 8) => ptzCommand(action, speed).catch(() => {})
+  // Compute all 4 corners from the stored left/right/top/bottom bounds
+  const corners = useMemo(() => {
+    if (!bounds) return null
+    const { left, right, top, bottom } = bounds
+    if (left == null || right == null || top == null || bottom == null) return null
+    return {
+      top_left:     { pan: left,  tilt: top    },
+      top_right:    { pan: right, tilt: top    },
+      bottom_left:  { pan: left,  tilt: bottom },
+      bottom_right: { pan: right, tilt: bottom },
+    }
+  }, [bounds])
+
+  const sendPtz = (action, speed = 3) => ptzCommand(action, speed).catch(() => {})
   const stopPtz = () => {
     ptzCommand('stop').catch(() => {})
     ptzCommand('zoomstop').catch(() => {})
@@ -188,18 +203,18 @@ export default function LiveView({ scanning, ptzPos }) {
           <PtzBtn label="－ Zoom" wide onStart={() => sendPtz('zoomout')} onEnd={() => ptzCommand('zoomstop').catch(() => {})} />
         </div>
 
-        {/* Bounds shortcuts */}
-        {bounds && (bounds.top_left || bounds.bottom_right) && (
+        {/* Bounds shortcuts — 2×2 grid */}
+        {corners && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             <div style={{ color: C.muted, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', textAlign: 'center' }}>
               Bounds
             </div>
-            {bounds.top_left && (
-              <GoToBoundBtn label="↖ Top-Left" onClick={() => gotoBound('top_left').catch(() => {})} />
-            )}
-            {bounds.bottom_right && (
-              <GoToBoundBtn label="↘ Bot-Right" onClick={() => gotoBound('bottom_right').catch(() => {})} />
-            )}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+              <GoToBoundBtn label="↖ TL" color={C.green}  onClick={() => gotoBound('top_left').catch(() => {})} />
+              <GoToBoundBtn label="↗ TR" color={C.purple} onClick={() => gotoBound('top_right').catch(() => {})} />
+              <GoToBoundBtn label="↙ BL" color={C.orange} onClick={() => gotoBound('bottom_left').catch(() => {})} />
+              <GoToBoundBtn label="↘ BR" color={C.accent} onClick={() => gotoBound('bottom_right').catch(() => {})} />
+            </div>
           </div>
         )}
       </div>
@@ -208,19 +223,19 @@ export default function LiveView({ scanning, ptzPos }) {
 }
 
 // ── One-shot button for going to a saved bound position ──────────────────────
-function GoToBoundBtn({ label, onClick }) {
+function GoToBoundBtn({ label, onClick, color }) {
+  const borderColor = color || C.border
   return (
     <button
       onClick={onClick}
       style={{
         background: '#0f172a',
-        border: `1px solid ${C.border}`,
-        color: C.text,
+        border: `1px solid ${borderColor}`,
+        color: color || C.text,
         borderRadius: 6,
         cursor: 'pointer',
-        fontWeight: 600,
+        fontWeight: 700,
         fontSize: 11,
-        width: 132,
         height: 34,
         display: 'flex',
         alignItems: 'center',

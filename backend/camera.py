@@ -438,17 +438,30 @@ async def _calibrated_scan(
     """
     import database as db
     bounds = db.get_config("camera_bounds", {})
-    tl = bounds.get("top_left")
-    br = bounds.get("bottom_right")
-    if not tl or not br:
-        logger.error("No camera bounds saved — cannot do calibrated scan. Set bounds in Calibration.")
-        return []
 
-    pan_tl, tilt_tl = int(tl["pan"]), int(tl["tilt"])
-    pan_br, tilt_br = int(br["pan"]), int(br["tilt"])
+    # New format: individual left/right/top/bottom edges
+    left   = bounds.get("left")
+    right  = bounds.get("right")
+    top    = bounds.get("top")
+    bottom = bounds.get("bottom")
 
-    # Use the override zoom if set, otherwise use the top-left corner zoom
-    zoom = int(bounds.get("zoom") or tl.get("zoom") or 10000)
+    # Fallback: migrate from old {top_left, bottom_right} format
+    if left is None or right is None or top is None or bottom is None:
+        tl = bounds.get("top_left")
+        br = bounds.get("bottom_right")
+        if not tl or not br:
+            logger.error("No camera bounds saved — cannot do calibrated scan. Set bounds in Calibration.")
+            return []
+        left   = int(tl["pan"])
+        right  = int(br["pan"])
+        top    = int(tl["tilt"])
+        bottom = int(br["tilt"])
+
+    pan_tl,  tilt_tl = int(left),  int(top)
+    pan_br,  tilt_br = int(right), int(bottom)
+
+    # Use the override zoom if set, otherwise default to 10000
+    zoom = int(bounds.get("zoom") or 10000)
     zoom = max(1, zoom)
 
     # At zoom=10000 each photo covers ~75 pan units; vertical step is fixed at 50
