@@ -34,7 +34,13 @@ TILE_OVERLAP = 0.50  # 50% overlap between tiles to avoid missing edge detection
 NMS_IOU      = 0.30  # IOU threshold for cross-tile deduplication
 
 # Max tiles per YOLO batch call. Reduce if you hit memory pressure (min 1).
-TILE_BATCH_SIZE = int(os.getenv("TILE_BATCH_SIZE", "24"))
+# Default is 4 to avoid OOM on CPU-only hosts; raise via TILE_BATCH_SIZE env var
+# if your machine has ample RAM (e.g. TILE_BATCH_SIZE=12 for 16 GB+).
+TILE_BATCH_SIZE = int(os.getenv("TILE_BATCH_SIZE", "4"))
+
+# Inference image size per tile. 640 uses ~4× less memory than 1280 with minimal
+# accuracy loss for person-sized objects; override with YOLO_IMGSZ env var.
+YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "640"))
 
 
 def _get_model():
@@ -149,7 +155,7 @@ def detect_people(image: np.ndarray, confidence: float = 0.10) -> List[Dict]:
             batch_tiles,
             classes=[0],
             conf=confidence,
-            imgsz=1280,
+            imgsz=YOLO_IMGSZ,
             verbose=False,
         )
 
