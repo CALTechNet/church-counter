@@ -259,7 +259,9 @@ def _composite_homography(
     canvas_w = int(np.ceil(max_x - min_x))
     canvas_h = int(np.ceil(max_y - min_y))
 
-    # Cap canvas to prevent memory blow-up
+    # Cap canvas to prevent memory blow-up.
+    # With float32 buffers, peak memory ≈ 32 bytes/pixel × frame count overhead.
+    # 16000 max dim keeps worst-case (16000×16000) under ~10 GB.
     max_dim = 16000
     if max(canvas_w, canvas_h) > max_dim:
         s = max_dim / max(canvas_w, canvas_h)
@@ -270,8 +272,8 @@ def _composite_homography(
 
     logger.info(f"Canvas size: {canvas_w} × {canvas_h}")
 
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float64)
-    weight = np.zeros((canvas_h, canvas_w), dtype=np.float64)
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
+    weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
 
     for i, (frame, H) in enumerate(zip(frames, homographies)):
         H_final = T @ H
@@ -301,9 +303,9 @@ def _composite_homography(
 
         # Distance transform gives smooth per-pixel blending weights
         # (high in the centre of the valid area, tapering to zero at edges)
-        dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5).astype(np.float64)
+        dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5)
 
-        canvas += warped.astype(np.float64) * dist[:, :, None]
+        canvas += warped.astype(np.float32) * dist[:, :, None]
         weight += dist
 
         if (i + 1) % 10 == 0 or i == len(frames) - 1:
