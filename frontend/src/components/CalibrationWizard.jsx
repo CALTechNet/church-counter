@@ -128,6 +128,7 @@ export default function CalibrationWizard({ onClose }) {
       ArrowRight: 'right',
     }
     const onKeyDown = (e) => {
+      if (e.target.tagName === 'INPUT') return
       const action = KEY_ACTION[e.key]
       if (!action || pressed.has(e.key)) return
       e.preventDefault()
@@ -282,7 +283,7 @@ export default function CalibrationWizard({ onClose }) {
 
             <Divider />
 
-            {/* Bounding edges — 2 columns */}
+            {/* Bounding edges — capture or type */}
             <Section label="Set Bounds">
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                 {/* Pan edges */}
@@ -291,6 +292,13 @@ export default function CalibrationWizard({ onClose }) {
                 {/* Tilt edges */}
                 <EdgeBtn label="▲ Set Top"   color={C.yellow} set={topTilt   != null} value={topTilt}   unit="tilt" onClick={captureTop}    disabled={pos.tilt == null} />
                 <EdgeBtn label="Set Bot ▼"   color={C.orange} set={bottomTilt!= null} value={bottomTilt}unit="tilt" onClick={captureBottom} disabled={pos.tilt == null} />
+              </div>
+              <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>Or type VISCA values below:</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5 }}>
+                <NumericInput label="Left Pan"   color={C.green}  value={leftPan}    onChange={v => { setLeftPan(v);    setStatus(`Left edge set (pan ${v}).`) }} />
+                <NumericInput label="Right Pan"  color={C.accent} value={rightPan}   onChange={v => { setRightPan(v);   setStatus(`Right edge set (pan ${v}).`) }} />
+                <NumericInput label="Top Tilt"   color={C.yellow} value={topTilt}    onChange={v => { setTopTilt(v);    setStatus(`Top edge set (tilt ${v}).`) }} />
+                <NumericInput label="Bot Tilt"   color={C.orange} value={bottomTilt} onChange={v => { setBottomTilt(v); setStatus(`Bottom edge set (tilt ${v}).`) }} />
               </div>
             </Section>
 
@@ -301,9 +309,7 @@ export default function CalibrationWizard({ onClose }) {
               <button onClick={captureZoom} disabled={pos.zoom == null} style={actionBtn(C.yellow, pos.zoom == null)}>
                 Set Zoom
               </button>
-              <div style={{ fontSize: 10, color: scanZoom != null ? C.yellow : C.muted, fontFamily: 'monospace', marginTop: 4 }}>
-                {scanZoom != null ? `Zoom ${scanZoom}` : 'Not set'}
-              </div>
+              <NumericInput label="Zoom" color={C.yellow} value={scanZoom} min={0} max={65535} onChange={v => { setScanZoom(v); setStatus(`Scan zoom set to ${v}.`) }} />
             </Section>
 
             <Divider />
@@ -449,6 +455,50 @@ function GotoBtn({ label, color, onClick }) {
     >
       {label}
     </button>
+  )
+}
+
+/** Inline numeric input for typing VISCA values directly */
+function NumericInput({ label, color, value, onChange, min = -32768, max = 32767 }) {
+  const [draft, setDraft] = useState('')
+  const [editing, setEditing] = useState(false)
+
+  const commit = () => {
+    setEditing(false)
+    const trimmed = draft.trim()
+    if (trimmed === '' || isNaN(trimmed)) return
+    const n = Math.max(min, Math.min(max, parseInt(trimmed, 10)))
+    onChange(n)
+  }
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+      <span style={{ fontSize: 9, color: color, fontWeight: 700, width: 52, flexShrink: 0 }}>{label}</span>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        placeholder={value != null ? String(value) : '--'}
+        value={editing ? draft : (value != null ? String(value) : '')}
+        onFocus={() => { setEditing(true); setDraft(value != null ? String(value) : '') }}
+        onBlur={commit}
+        onKeyDown={e => { if (e.key === 'Enter') { e.target.blur() } }}
+        onChange={e => setDraft(e.target.value)}
+        style={{
+          flex: 1,
+          minWidth: 0,
+          background: C.bg,
+          border: `1px solid ${value != null ? color : C.border}`,
+          color: C.text,
+          borderRadius: 4,
+          padding: '4px 6px',
+          fontSize: 11,
+          fontFamily: 'monospace',
+          outline: 'none',
+          width: '100%',
+        }}
+      />
+    </div>
   )
 }
 
