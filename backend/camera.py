@@ -18,6 +18,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+ProgressCB = Callable[[str, int], Awaitable[None]]
+
 # Default / fallback values (overridden by DB settings at runtime)
 CAMERA_IP  = "10.10.140.140"
 VISCA_PORT = 5678
@@ -405,8 +407,6 @@ def get_live_frame() -> Optional[np.ndarray]:
 
 
 # ── Auto-scan ─────────────────────────────────────────────────────────────────
-ProgressCB = Callable[[str, int], Awaitable[None]]
-
 
 async def _preset_scan(
     presets: List[int],
