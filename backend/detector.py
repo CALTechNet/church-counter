@@ -99,7 +99,7 @@ def _nms_detections(detections: List[Dict], iou_threshold: float = NMS_IOU) -> L
 
 
 # ── Tiled detection ────────────────────────────────────────────────────────────
-def detect_people(image: np.ndarray, confidence: float = 0.10) -> List[Dict]:
+def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
     """
     Run YOLO26x on image using batched tiled inference.
     Splits the panorama into a TILE_COLS x TILE_ROWS grid with TILE_OVERLAP overlap.

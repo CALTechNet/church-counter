@@ -160,7 +160,7 @@ def _stitch_batch(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
         return frames[0], "single_frame"
 
     # Frames are already enhanced (CLAHE+gamma applied on raw data upstream).
-    stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+    stitcher = cv2.Stitcher_create(cv2.Stitcher_SCANS)
     status, pano = stitcher.stitch(frames)
     if status == cv2.Stitcher_OK:
         pano = _crop_black(pano)
