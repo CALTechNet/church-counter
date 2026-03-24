@@ -9,6 +9,9 @@ export async function getCapture()     { return _get('/api/capture') }
 export async function triggerScan(serviceType = 'Manual') {
   return _post(`/api/scan/trigger?service_type=${encodeURIComponent(serviceType)}`)
 }
+export async function cancelScan() {
+  return _post('/api/scan/cancel')
+}
 export async function saveCalPoint(pt) { return _post('/api/calibration', pt) }
 export async function deleteCalPoint(seatId) {
   const r = await fetch(`${BASE}/api/calibration/${seatId}`, { method: 'DELETE' })

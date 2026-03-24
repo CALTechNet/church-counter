@@ -5,7 +5,7 @@ import DataTable from './components/DataTable.jsx'
 import LiveView from './components/LiveView.jsx'
 import CalibrationWizard from './components/CalibrationWizard.jsx'
 import SettingsModal from './components/SettingsModal.jsx'
-import { getStatus, triggerScan, createWebSocket, getPtzPosition, getSettings } from './api.js'
+import { getStatus, triggerScan, cancelScan, createWebSocket, getPtzPosition, getSettings } from './api.js'
 import { VERSION } from './version.js'
 import { useIsMobile } from './hooks/useIsMobile.js'
 
@@ -85,6 +85,10 @@ export default function App() {
           setRawImageB64(msg.raw_image_b64 ?? null)
           setZoomImageB64(msg.zoom_image_b64)
           showToast(`Scan complete — ${msg.count} people detected`)
+        } else if (msg.type === 'scan_cancelled') {
+          setScanState({ running: false, progress: 0, message: 'Cancelled' })
+          setScanStartedAt(null)
+          showToast('Scan cancelled', C.yellow)
         } else if (msg.type === 'scan_error') {
           setScanState(s => ({ ...s, running: false, message: `Error: ${msg.error}` }))
           setScanStartedAt(null)
@@ -117,6 +121,14 @@ export default function App() {
   const handleScan = async () => {
     try {
       await triggerScan(serviceType)
+    } catch (e) {
+      showToast(e.message, C.red)
+    }
+  }
+
+  const handleCancel = async () => {
+    try {
+      await cancelScan()
     } catch (e) {
       showToast(e.message, C.red)
     }
@@ -191,14 +203,14 @@ export default function App() {
             {scanState.running ? '⏳ Scanning…' : '▶ Scan Now'}
           </button>
 
-          {/* Force reset — shown when scan has been running >5 min */}
-          {scanState.running && scanStartedAt && (Date.now() - scanStartedAt) > 300000 && (
+          {/* Cancel button — shown while a scan is running */}
+          {scanState.running && (
             <button
-              onClick={() => { setScanState({ running: false, progress: 0, message: 'Idle' }); setScanStartedAt(null) }}
-              style={{ background: C.red, color: '#fff', border: 'none', borderRadius: 8, padding: '8px 12px', fontWeight: 600, fontSize: 12, cursor: 'pointer' }}
-              title="Force reset stuck scan state"
+              onClick={handleCancel}
+              style={{ background: C.red, color: '#fff', border: 'none', borderRadius: 8, padding: '8px 12px', fontWeight: 600, fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' }}
+              title="Cancel the current scan"
             >
-              ✕ Reset
+              ✕ Cancel
             </button>
           )}
 

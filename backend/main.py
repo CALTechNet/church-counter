@@ -47,6 +47,11 @@ state = {
     "latest_detections": [],
 }
 _ws_clients: list[WebSocket] = []
+_scan_cancel = asyncio.Event()
+
+
+class _ScanCancelledError(Exception):
+    pass
 
 
 async def _broadcast(data: dict):
@@ -73,6 +78,7 @@ async def run_scan(service_type: str = "Manual"):
         logger.warning("Scan already in progress — ignoring request")
         return
 
+    _scan_cancel.clear()
     state["running"] = True
     await _broadcast({"type": "scan_started", "service_type": service_type})
 
@@ -83,7 +89,9 @@ async def run_scan(service_type: str = "Manual"):
 
         # 1. Capture
         await _progress("Scanning…", 0)
-        frames = await cam.auto_scan(progress_callback=_progress)
+        frames = await cam.auto_scan(progress_callback=_progress, cancel_event=_scan_cancel)
+        if _scan_cancel.is_set():
+            raise _ScanCancelledError()
         if not frames:
             raise RuntimeError("Camera returned 0 frames")
 
@@ -148,6 +156,10 @@ async def run_scan(service_type: str = "Manual"):
         })
         logger.info(f"Scan done: {total} people  service={service_type}  ts={ts}")
 
+    except _ScanCancelledError:
+        logger.info("Scan cancelled by user")
+        state["message"] = "Cancelled"
+        await _broadcast({"type": "scan_cancelled"})
     except Exception as exc:
         logger.exception(f"Scan error: {exc}")
         state["message"] = f"Error: {exc}"
@@ -206,6 +218,14 @@ async def api_trigger(service_type: str = "Manual"):
         raise HTTPException(409, "Scan already in progress")
     asyncio.create_task(run_scan(service_type=service_type))
     return {"status": "started", "service_type": service_type}
+
+
+@app.post("/api/scan/cancel")
+async def api_cancel_scan():
+    if not state["running"]:
+        raise HTTPException(409, "No scan in progress")
+    _scan_cancel.set()
+    return {"status": "cancelling"}
 
 
 @app.get("/api/scan/image")
