@@ -9,6 +9,7 @@ import asyncio
 import logging
 import math
 import socket
+import threading
 import time
 from typing import List, Optional, Callable, Awaitable
 
@@ -291,6 +292,72 @@ def capture_frame(url: str = None) -> Optional[np.ndarray]:
     if frame is None:
         logger.warning("Failed to capture frame from RTSP stream")
     return frame
+
+
+# ── Persistent live-view capture (10 fps) ─────────────────────────────────────
+_live_lock   = threading.Lock()
+_live_latest: Optional[np.ndarray] = None
+_live_stop   = threading.Event()
+_live_thread: Optional[threading.Thread] = None
+
+
+def _live_reader_thread(url: str, stop: threading.Event) -> None:
+    """Background thread: keep RTSP stream open and update _live_latest."""
+    global _live_latest
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    while not stop.is_set():
+        ret, frame = cap.read()
+        if ret:
+            with _live_lock:
+                _live_latest = frame
+        else:
+            # Reconnect on failure
+            cap.release()
+            if stop.is_set():
+                break
+            time.sleep(0.5)
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.release()
+
+
+def start_live_capture() -> None:
+    """Start (or restart) the persistent background live-capture thread."""
+    global _live_thread, _live_stop, _live_latest
+    # Stop any existing thread
+    _live_stop.set()
+    if _live_thread and _live_thread.is_alive():
+        _live_thread.join(timeout=3)
+    with _live_lock:
+        _live_latest = None
+    _live_stop = threading.Event()
+    url = _get_rtsp_url()
+    _live_thread = threading.Thread(
+        target=_live_reader_thread,
+        args=(url, _live_stop),
+        daemon=True,
+        name="live-capture",
+    )
+    _live_thread.start()
+    logger.info("Live-capture thread started")
+
+
+def stop_live_capture() -> None:
+    """Stop the persistent live-capture thread."""
+    global _live_latest
+    _live_stop.set()
+    if _live_thread and _live_thread.is_alive():
+        _live_thread.join(timeout=3)
+    with _live_lock:
+        _live_latest = None
+    logger.info("Live-capture thread stopped")
+
+
+def get_live_frame() -> Optional[np.ndarray]:
+    """Return the most-recently captured live frame (non-blocking)."""
+    with _live_lock:
+        return _live_latest.copy() if _live_latest is not None else None
 
 
 # ── Auto-scan ─────────────────────────────────────────────────────────────────

@@ -388,10 +388,25 @@ async def api_capture():
     return {"image_b64": stitch.to_base64(frame, quality=90)}
 
 
-# ── Live frame — lower quality for fast polling ───────────────────────────────
+# ── Live frame — persistent stream for ~10 fps polling ───────────────────────
+@app.post("/api/live-frame/start")
+async def api_live_frame_start():
+    cam.start_live_capture()
+    return {"ok": True}
+
+
+@app.post("/api/live-frame/stop")
+async def api_live_frame_stop():
+    cam.stop_live_capture()
+    return {"ok": True}
+
+
 @app.get("/api/live-frame")
 async def api_live_frame():
-    frame = await asyncio.to_thread(cam.capture_frame)
+    # Lazily start the persistent capture thread if not running
+    if cam._live_thread is None or not cam._live_thread.is_alive():
+        cam.start_live_capture()
+    frame = cam.get_live_frame()
     if frame is None:
         raise HTTPException(503, "Could not capture frame from camera")
     return {"image_b64": stitch.to_base64(frame, quality=65)}
