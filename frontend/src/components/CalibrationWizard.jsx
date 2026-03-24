@@ -1,10 +1,10 @@
 /**
  * Calibration Wizard — Camera Bounds Setup
- * Move camera to top-left and bottom-right corners, set zoom, save.
+ * Set left/right pan edges, top/bottom tilt edges, and scan zoom independently.
  * Live feed streams continuously with no buffer for real-time feedback.
  */
-import { useState, useEffect, useRef, useCallback } from 'react'
-import { ptzCommand, getPtzPosition, getCameraBounds, saveCameraBounds } from '../api.js'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { ptzCommand, getPtzPosition, getCameraBounds, saveCameraBounds, gotoBound } from '../api.js'
 
 const C = {
   bg:      '#0f172a',
@@ -16,6 +16,8 @@ const C = {
   green:   '#22c55e',
   red:     '#ef4444',
   yellow:  '#eab308',
+  purple:  '#a855f7',
+  orange:  '#f97316',
 }
 
 export default function CalibrationWizard({ onClose }) {
@@ -26,9 +28,12 @@ export default function CalibrationWizard({ onClose }) {
   const [pos, setPos]               = useState({ pan: null, tilt: null, zoom: null })
   const [posError, setPosError]     = useState(false)
 
-  const [topLeft, setTopLeft]       = useState(null)   // {pan, tilt, zoom}
-  const [botRight, setBotRight]     = useState(null)   // {pan, tilt, zoom}
-  const [scanZoom, setScanZoom]     = useState(null)   // standalone zoom override
+  // Individual edge bounds
+  const [leftPan,    setLeftPan]    = useState(null)
+  const [rightPan,   setRightPan]   = useState(null)
+  const [topTilt,    setTopTilt]    = useState(null)
+  const [bottomTilt, setBottomTilt] = useState(null)
+  const [scanZoom,   setScanZoom]   = useState(null)
 
   const [saving, setSaving]         = useState(false)
   const [saved, setSaved]           = useState(false)
@@ -37,6 +42,17 @@ export default function CalibrationWizard({ onClose }) {
   const lastFrameTime = useRef(null)
   const liveRunning   = useRef(false)
   const posInterval   = useRef(null)
+
+  // Computed 4 corners from stored edges
+  const corners = useMemo(() => {
+    if (leftPan == null || rightPan == null || topTilt == null || bottomTilt == null) return null
+    return {
+      top_left:     { pan: leftPan,  tilt: topTilt },
+      top_right:    { pan: rightPan, tilt: topTilt },
+      bottom_left:  { pan: leftPan,  tilt: bottomTilt },
+      bottom_right: { pan: rightPan, tilt: bottomTilt },
+    }
+  }, [leftPan, rightPan, topTilt, bottomTilt])
 
   // ── Live feed — 10 fps polling against persistent backend stream ─────────
   useEffect(() => {
@@ -60,14 +76,12 @@ export default function CalibrationWizard({ onClose }) {
       } catch (e) {
         if (liveRunning.current) setFrameError(e.message)
       }
-      // Target 10 fps: schedule next fetch 100 ms from now
       if (liveRunning.current) setTimeout(fetchFrame, 100)
     }
 
     fetchFrame()
     return () => {
       liveRunning.current = false
-      // Release the persistent stream when the wizard closes
       fetch('/api/live-frame/stop', { method: 'POST' }).catch(() => {})
     }
   }, [])
@@ -91,14 +105,16 @@ export default function CalibrationWizard({ onClose }) {
   // ── Load existing bounds on mount ─────────────────────────────────────────
   useEffect(() => {
     getCameraBounds().then(b => {
-      if (b.top_left)     setTopLeft(b.top_left)
-      if (b.bottom_right) setBotRight(b.bottom_right)
-      if (b.zoom != null) setScanZoom(b.zoom)
+      if (b.left   != null) setLeftPan(b.left)
+      if (b.right  != null) setRightPan(b.right)
+      if (b.top    != null) setTopTilt(b.top)
+      if (b.bottom != null) setBottomTilt(b.bottom)
+      if (b.zoom   != null) setScanZoom(b.zoom)
     }).catch(() => {})
   }, [])
 
   // ── PTZ control helpers ───────────────────────────────────────────────────
-  const sendPtz  = useCallback((action, speed = 8) => ptzCommand(action, speed).catch(() => {}), [])
+  const sendPtz  = useCallback((action, speed = 3) => ptzCommand(action, speed).catch(() => {}), [])
   const stopPan  = useCallback(() => ptzCommand('stop').catch(() => {}), [])
   const stopZoom = useCallback(() => ptzCommand('zoomstop').catch(() => {}), [])
 
@@ -132,33 +148,27 @@ export default function CalibrationWizard({ onClose }) {
   }, [])
 
   // ── Bounds capture ────────────────────────────────────────────────────────
-  const captureTopLeft = () => {
-    if (pos.pan == null) return
-    setTopLeft({ pan: pos.pan, tilt: pos.tilt, zoom: pos.zoom })
-    setStatus('Top-left corner set.')
-  }
-
-  const captureBotRight = () => {
-    if (pos.pan == null) return
-    setBotRight({ pan: pos.pan, tilt: pos.tilt, zoom: pos.zoom })
-    setStatus('Bottom-right corner set.')
-  }
-
-  const captureZoom = () => {
-    if (pos.zoom == null) return
-    setScanZoom(pos.zoom)
-    setStatus(`Scan zoom set to ${pos.zoom}.`)
-  }
+  const captureLeft   = () => { if (pos.pan  == null) return; setLeftPan(pos.pan);     setStatus(`Left edge set (pan ${pos.pan}).`) }
+  const captureRight  = () => { if (pos.pan  == null) return; setRightPan(pos.pan);    setStatus(`Right edge set (pan ${pos.pan}).`) }
+  const captureTop    = () => { if (pos.tilt == null) return; setTopTilt(pos.tilt);    setStatus(`Top edge set (tilt ${pos.tilt}).`) }
+  const captureBottom = () => { if (pos.tilt == null) return; setBottomTilt(pos.tilt); setStatus(`Bottom edge set (tilt ${pos.tilt}).`) }
+  const captureZoom   = () => { if (pos.zoom == null) return; setScanZoom(pos.zoom);   setStatus(`Scan zoom set to ${pos.zoom}.`) }
 
   // ── Save ──────────────────────────────────────────────────────────────────
   const save = async () => {
-    if (!topLeft && !botRight && scanZoom == null) {
+    if (leftPan == null && rightPan == null && topTilt == null && bottomTilt == null && scanZoom == null) {
       setStatus('Nothing to save — set at least one bound.')
       return
     }
     setSaving(true)
     try {
-      await saveCameraBounds({ top_left: topLeft, bottom_right: botRight, zoom: scanZoom })
+      await saveCameraBounds({
+        left:   leftPan,
+        right:  rightPan,
+        top:    topTilt,
+        bottom: bottomTilt,
+        zoom:   scanZoom,
+      })
       setSaved(true)
       setStatus('Bounds saved!')
       setTimeout(onClose, 900)
@@ -169,8 +179,7 @@ export default function CalibrationWizard({ onClose }) {
     }
   }
 
-  const posStr = p =>
-    p ? `Pan ${p.pan}  Tilt ${p.tilt}  Zoom ${p.zoom}` : 'Not set'
+  const allCornersSet = corners != null
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
@@ -179,7 +188,7 @@ export default function CalibrationWizard({ onClose }) {
         {/* Header */}
         <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '14px 20px', display: 'flex', alignItems: 'center', gap: 14, flexShrink: 0 }}>
           <span style={{ fontSize: 17, fontWeight: 700 }}>⚙ Camera Calibration</span>
-          <span style={{ fontSize: 12, color: C.muted }}>Set scan bounds — move camera, then click Set buttons</span>
+          <span style={{ fontSize: 12, color: C.muted }}>Set left/right pan edges, top/bottom tilt edges, then set zoom</span>
           {status && <span style={{ marginLeft: 'auto', fontSize: 12, color: C.yellow }}>{status}</span>}
           <button onClick={onClose} style={{ marginLeft: status ? 0 : 'auto', background: 'transparent', border: `1px solid ${C.border}`, color: C.muted, borderRadius: 8, padding: '5px 12px', cursor: 'pointer', fontSize: 13 }}>✕ Close</button>
         </div>
@@ -225,23 +234,29 @@ export default function CalibrationWizard({ onClose }) {
               }
             </div>
 
-            {/* Bounds corners overlay */}
-            {topLeft && (
-              <div style={{ position: 'absolute', top: 10, right: 10, background: 'rgba(34,197,94,0.85)', color: '#000', padding: '3px 8px', borderRadius: 4, fontSize: 10, fontFamily: 'monospace', fontWeight: 700 }}>
-                TL SET
-              </div>
-            )}
-            {botRight && (
-              <div style={{ position: 'absolute', bottom: 10, right: 10, background: 'rgba(59,130,246,0.85)', color: '#fff', padding: '3px 8px', borderRadius: 4, fontSize: 10, fontFamily: 'monospace', fontWeight: 700 }}>
-                BR SET
-              </div>
+            {/* Corner overlay badges */}
+            {corners && (
+              <>
+                <div style={{ position: 'absolute', top: 10, right: 10, background: 'rgba(34,197,94,0.85)', color: '#000', padding: '3px 8px', borderRadius: 4, fontSize: 10, fontFamily: 'monospace', fontWeight: 700 }}>
+                  TL
+                </div>
+                <div style={{ position: 'absolute', top: 10, left: '50%', transform: 'translateX(-50%)', background: 'rgba(168,85,247,0.85)', color: '#fff', padding: '3px 8px', borderRadius: 4, fontSize: 10, fontFamily: 'monospace', fontWeight: 700 }}>
+                  TR
+                </div>
+                <div style={{ position: 'absolute', bottom: 10, right: 10, background: 'rgba(59,130,246,0.85)', color: '#fff', padding: '3px 8px', borderRadius: 4, fontSize: 10, fontFamily: 'monospace', fontWeight: 700 }}>
+                  BR
+                </div>
+                <div style={{ position: 'absolute', bottom: 10, left: '50%', transform: 'translateX(-50%)', background: 'rgba(249,115,22,0.85)', color: '#fff', padding: '3px 8px', borderRadius: 4, fontSize: 10, fontFamily: 'monospace', fontWeight: 700 }}>
+                  BL
+                </div>
+              </>
             )}
 
             <style>{`@keyframes livePulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
           </div>
 
           {/* ── Right sidebar ── */}
-          <div style={{ width: 220, background: C.surface, borderLeft: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 0, flexShrink: 0, overflowY: 'auto' }}>
+          <div style={{ width: 240, background: C.surface, borderLeft: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 0, flexShrink: 0, overflowY: 'auto' }}>
 
             {/* PTZ section */}
             <Section label="PTZ Controls">
@@ -267,44 +282,44 @@ export default function CalibrationWizard({ onClose }) {
 
             <Divider />
 
-            {/* Top Left */}
-            <Section label="Top Left Corner">
-              <button onClick={captureTopLeft} disabled={pos.pan == null} style={actionBtn(C.green, pos.pan == null)}>
-                Set Top Left
-              </button>
-              <div style={{ fontSize: 10, color: topLeft ? C.green : C.muted, fontFamily: 'monospace', marginTop: 4, lineHeight: 1.5 }}>
-                {topLeft
-                  ? <>Pan {topLeft.pan}<br />Tilt {topLeft.tilt}<br />Zoom {topLeft.zoom}</>
-                  : 'Not set'
-                }
+            {/* Bounding edges — 2 columns */}
+            <Section label="Set Bounds">
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                {/* Pan edges */}
+                <EdgeBtn label="◀ Set Left"  color={C.green}  set={leftPan   != null} value={leftPan}   unit="pan"  onClick={captureLeft}   disabled={pos.pan == null} />
+                <EdgeBtn label="Set Right ▶" color={C.accent} set={rightPan  != null} value={rightPan}  unit="pan"  onClick={captureRight}  disabled={pos.pan == null} />
+                {/* Tilt edges */}
+                <EdgeBtn label="▲ Set Top"   color={C.yellow} set={topTilt   != null} value={topTilt}   unit="tilt" onClick={captureTop}    disabled={pos.tilt == null} />
+                <EdgeBtn label="Set Bot ▼"   color={C.orange} set={bottomTilt!= null} value={bottomTilt}unit="tilt" onClick={captureBottom} disabled={pos.tilt == null} />
               </div>
             </Section>
 
             <Divider />
 
-            {/* Bottom Right */}
-            <Section label="Bottom Right Corner">
-              <button onClick={captureBotRight} disabled={pos.pan == null} style={actionBtn(C.accent, pos.pan == null)}>
-                Set Bottom Right
-              </button>
-              <div style={{ fontSize: 10, color: botRight ? C.accent : C.muted, fontFamily: 'monospace', marginTop: 4, lineHeight: 1.5 }}>
-                {botRight
-                  ? <>Pan {botRight.pan}<br />Tilt {botRight.tilt}<br />Zoom {botRight.zoom}</>
-                  : 'Not set'
-                }
-              </div>
-            </Section>
-
-            <Divider />
-
-            {/* Zoom */}
+            {/* Scan Zoom */}
             <Section label="Scan Zoom">
               <button onClick={captureZoom} disabled={pos.zoom == null} style={actionBtn(C.yellow, pos.zoom == null)}>
                 Set Zoom
               </button>
               <div style={{ fontSize: 10, color: scanZoom != null ? C.yellow : C.muted, fontFamily: 'monospace', marginTop: 4 }}>
-                {scanZoom != null ? `Zoom ${scanZoom}` : 'Not set (uses corner values)'}
+                {scanZoom != null ? `Zoom ${scanZoom}` : 'Not set'}
               </div>
+            </Section>
+
+            <Divider />
+
+            {/* Go-to corners 2×2 matrix */}
+            <Section label="Go To Corner">
+              {allCornersSet ? (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5 }}>
+                  <GotoBtn label="↖ TL" color={C.green}  onClick={() => gotoBound('top_left').catch(() => {})} />
+                  <GotoBtn label="↗ TR" color={C.purple} onClick={() => gotoBound('top_right').catch(() => {})} />
+                  <GotoBtn label="↙ BL" color={C.orange} onClick={() => gotoBound('bottom_left').catch(() => {})} />
+                  <GotoBtn label="↘ BR" color={C.accent} onClick={() => gotoBound('bottom_right').catch(() => {})} />
+                </div>
+              ) : (
+                <div style={{ fontSize: 10, color: C.muted }}>Set all 4 edges to enable.</div>
+              )}
             </Section>
 
             <Divider />
@@ -376,6 +391,58 @@ function PtzBtn({ label, onStart, onEnd, wide }) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
+        userSelect: 'none',
+        WebkitUserSelect: 'none',
+      }}
+    >
+      {label}
+    </button>
+  )
+}
+
+/** A capture button showing current value if set */
+function EdgeBtn({ label, color, set, value, unit, onClick, disabled }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        background: disabled ? C.border : set ? color : C.bg,
+        border: `1px solid ${set ? color : C.border}`,
+        color: disabled ? C.muted : set ? (color === C.yellow ? '#000' : '#fff') : C.text,
+        borderRadius: 7,
+        fontWeight: 700,
+        fontSize: 10,
+        padding: '7px 4px',
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.6 : 1,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 2,
+        userSelect: 'none',
+      }}
+    >
+      <span>{label}</span>
+      {set && <span style={{ fontFamily: 'monospace', fontSize: 9, opacity: 0.85 }}>{unit} {value}</span>}
+    </button>
+  )
+}
+
+/** One-shot goto corner button */
+function GotoBtn({ label, color, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: C.bg,
+        border: `1px solid ${color}`,
+        color: color,
+        borderRadius: 6,
+        fontWeight: 700,
+        fontSize: 11,
+        padding: '8px 0',
+        cursor: 'pointer',
         userSelect: 'none',
         WebkitUserSelect: 'none',
       }}

@@ -374,29 +374,62 @@ async def api_save_settings(body: AppSettings):
     return {**_SETTINGS_DEFAULTS, **existing}
 
 
-# ── Camera bounds (top-left / bottom-right scan corners) ─────────────────────
+# ── Camera bounds (individual pan/tilt edges + scan zoom) ─────────────────────
 class CameraBounds(BaseModel):
-    top_left:     Optional[dict] = None   # {pan, tilt, zoom}
-    bottom_right: Optional[dict] = None   # {pan, tilt, zoom}
-    zoom:         Optional[int]  = None
+    left:   Optional[int] = None   # pan value for left edge
+    right:  Optional[int] = None   # pan value for right edge
+    top:    Optional[int] = None   # tilt value for top edge
+    bottom: Optional[int] = None   # tilt value for bottom edge
+    zoom:   Optional[int] = None   # scan zoom level
+
+
+def _compute_corners(bounds: dict) -> dict:
+    """Compute all 4 corners from left/right/top/bottom bounds.
+    Migrates old top_left/bottom_right format transparently."""
+    left   = bounds.get("left")
+    right  = bounds.get("right")
+    top    = bounds.get("top")
+    bottom = bounds.get("bottom")
+
+    # Migrate from old {top_left: {pan, tilt}, bottom_right: {pan, tilt}} format
+    old_tl = bounds.get("top_left")
+    old_br = bounds.get("bottom_right")
+    if old_tl and left is None:
+        left = old_tl.get("pan")
+    if old_br and right is None:
+        right = old_br.get("pan")
+    if old_tl and top is None:
+        top = old_tl.get("tilt")
+    if old_br and bottom is None:
+        bottom = old_br.get("tilt")
+
+    zoom = bounds.get("zoom", 10000)
+    result = {**bounds, "left": left, "right": right, "top": top, "bottom": bottom}
+
+    if left is not None and top is not None:
+        result["top_left"]    = {"pan": left,  "tilt": top,    "zoom": zoom}
+    if right is not None and top is not None:
+        result["top_right"]   = {"pan": right, "tilt": top,    "zoom": zoom}
+    if left is not None and bottom is not None:
+        result["bottom_left"] = {"pan": left,  "tilt": bottom, "zoom": zoom}
+    if right is not None and bottom is not None:
+        result["bottom_right"]= {"pan": right, "tilt": bottom, "zoom": zoom}
+    return result
 
 
 @app.get("/api/camera-bounds")
 async def api_get_bounds():
-    return db.get_config("camera_bounds", {"top_left": None, "bottom_right": None, "zoom": None})
+    stored = db.get_config("camera_bounds", {})
+    return _compute_corners(stored)
 
 
 @app.post("/api/camera-bounds")
 async def api_save_bounds(bounds: CameraBounds):
     existing = db.get_config("camera_bounds", {})
-    if bounds.top_left is not None:
-        existing["top_left"] = bounds.top_left
-    if bounds.bottom_right is not None:
-        existing["bottom_right"] = bounds.bottom_right
-    if bounds.zoom is not None:
-        existing["zoom"] = bounds.zoom
+    patch = bounds.model_dump(exclude_none=True)
+    existing.update(patch)
     db.set_config("camera_bounds", existing)
-    return existing
+    return _compute_corners(existing)
 
 
 # ── Camera snapshot (for calibration wizard) ──────────────────────────────────
@@ -453,9 +486,10 @@ async def api_ptz_position():
 
 @app.post("/api/ptz/goto-bound")
 async def api_ptz_goto_bound(corner: str = "top_left"):
-    """Move camera to the saved top_left or bottom_right bound position."""
+    """Move camera to a computed corner (top_left, top_right, bottom_left, bottom_right)."""
     bounds = db.get_config("camera_bounds", {})
-    pos = bounds.get(corner)
+    corners = _compute_corners(bounds)
+    pos = corners.get(corner)
     if not pos:
         raise HTTPException(404, f"No bound saved for corner: {corner}")
     pan  = int(pos["pan"])
