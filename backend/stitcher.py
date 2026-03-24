@@ -100,25 +100,14 @@ def _stitch_sequential(frames: List[np.ndarray], label: str = "") -> np.ndarray:
     return result
 
 
-def _vconcat_strips(strips: List[np.ndarray]) -> np.ndarray:
-    """Resize all strips to the same width, then vertically concatenate."""
-    target_w = min(s.shape[1] for s in strips)
-    resized = []
-    for s in strips:
-        h, w = s.shape[:2]
-        new_h = int(h * target_w / w)
-        resized.append(cv2.resize(s, (target_w, new_h)))
-    return np.vstack(resized)
-
-
 def stitch_frames(
     frames: List[np.ndarray],
     grid_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Optional[np.ndarray], str]:
     """
     Stitch frames into a panorama — only ever 2 frames per OpenCV call.
-    When grid_shape (rows, cols) is provided, stitches each row sequentially,
-    then vertically concatenates the row strips.
+    Walks through every frame in order, stitching each onto the accumulator.
+    grid_shape is accepted but ignored (kept for API compat).
     Returns (image, status_message).
     """
     if not frames:
@@ -132,57 +121,10 @@ def stitch_frames(
     n = len(unique)
     logger.info(f"Stitching {n} unique frames (from {len(frames)} captured)")
 
-    # --- Grid-aware row-by-row stitching ---
-    if grid_shape is not None and n > 2:
-        rows, cols = grid_shape
-        logger.info(f"Grid-aware stitch: {rows} rows × {cols} cols ({n} unique frames)")
-
-        row_strips = []
-        if n >= rows * cols:
-            # Full grid — use exact layout
-            for r in range(rows):
-                start = r * cols
-                row_frames = unique[start:start + cols]
-                logger.info(f"Row {r}: {len(row_frames)} frames")
-                strip = _stitch_sequential(row_frames, label=f"Row {r}: ")
-                row_strips.append(strip)
-                gc.collect()
-        else:
-            # Some dupes removed — distribute evenly
-            frames_per_row = max(1, n // rows)
-            idx = 0
-            for r in range(rows):
-                end = idx + frames_per_row
-                if r == rows - 1:
-                    end = n
-                row_frames = unique[idx:end]
-                if row_frames:
-                    logger.info(f"Row {r}: {len(row_frames)} frames")
-                    strip = _stitch_sequential(row_frames, label=f"Row {r}: ")
-                    row_strips.append(strip)
-                    gc.collect()
-                idx = end
-
-        if not row_strips:
-            return _stitch_sequential(unique, label="Fallback: "), "fallback_sequential"
-
-        if len(row_strips) == 1:
-            result = _crop_black(row_strips[0])
-            return result, "ok_grid"
-
-        # Combine row strips vertically
-        logger.info(f"Combining {len(row_strips)} row strips vertically")
-        result = _vconcat_strips(row_strips)
-        result = _crop_black(result)
-        logger.info(f"Grid stitch complete — output shape: {result.shape}")
-        return result, "ok_grid"
-
-    # --- No grid shape or small frame count: sequential pairwise ---
-    logger.info(f"Sequential pairwise stitch: {n} frames")
-    result = _stitch_sequential(unique, label="")
+    result = _stitch_sequential(unique)
     result = _crop_black(result)
-    logger.info(f"Sequential stitch complete — output shape: {result.shape}")
-    return result, "ok_sequential"
+    logger.info(f"Stitch complete — output shape: {result.shape}")
+    return result, "ok"
 
 
 def _deduplicate(frames: List[np.ndarray], threshold: float = 0.97) -> List[np.ndarray]:
