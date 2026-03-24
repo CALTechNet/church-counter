@@ -73,7 +73,7 @@ async def _progress(msg: str, pct: int):
     await _broadcast({"type": "progress", "message": msg, "progress": pct})
 
 
-async def run_scan(service_type: str = "Manual"):
+async def run_scan(service_type: str = "Manual", room_id: str = None):
     if state["running"]:
         logger.warning("Scan already in progress — ignoring request")
         return
@@ -81,7 +81,12 @@ async def run_scan(service_type: str = "Manual"):
     _scan_cancel.clear()
     state["running"] = True
     live_was_running = False
-    await _broadcast({"type": "scan_started", "service_type": service_type})
+
+    room = _get_room(room_id)
+    room_name = room.get("name", "Unknown")
+    camera_type = room.get("camera_type", "ptz_optics")
+
+    await _broadcast({"type": "scan_started", "service_type": service_type, "room": room_name})
 
     try:
         import cv2
@@ -89,12 +94,16 @@ async def run_scan(service_type: str = "Manual"):
         scan_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Capture
-        await _progress("Scanning…", 0)
-        frames = await cam.auto_scan(progress_callback=_progress, cancel_event=_scan_cancel)
+        await _progress(f"Scanning {room_name}…", 0)
+        frames = await cam.auto_scan(
+            progress_callback=_progress,
+            cancel_event=_scan_cancel,
+            room_config=room,
+        )
         if _scan_cancel.is_set():
             raise _ScanCancelledError()
         if not frames:
-            raise RuntimeError("Camera returned 0 frames")
+            raise RuntimeError(f"Camera returned 0 frames for {room_name}")
 
         # Pause live view during processing to free up resources
         live_was_running = cam._live_thread is not None and cam._live_thread.is_alive()
@@ -102,12 +111,17 @@ async def run_scan(service_type: str = "Manual"):
             cam.stop_live_capture()
             logger.info("Live view paused for YOLO processing")
 
-        # 2. Stitch
-        await _progress("Stitching panorama…", 93)
-        panorama, stitch_status = stitch.stitch_frames(frames)
-        if panorama is None:
-            raise RuntimeError("Panorama stitching failed")
-        logger.info(f"Stitch: {stitch_status} → shape {panorama.shape}")
+        # 2. Stitch (only for PTZ cameras with multiple frames)
+        if camera_type == "rtsp" or len(frames) == 1:
+            # Single frame — no stitching needed
+            panorama = frames[0]
+            logger.info(f"Single frame capture for {room_name} → shape {panorama.shape}")
+        else:
+            await _progress("Stitching panorama…", 93)
+            panorama, stitch_status = stitch.stitch_frames(frames)
+            if panorama is None:
+                raise RuntimeError("Panorama stitching failed")
+            logger.info(f"Stitch: {stitch_status} → shape {panorama.shape}")
 
         # 3. Detect
         await _progress("Running AI detection…", 96)
@@ -116,20 +130,20 @@ async def run_scan(service_type: str = "Manual"):
         annotated  = det.draw_detections(panorama, detections)
         image_b64  = stitch.to_base64(annotated)
         total      = len(detections)
-        logger.info(f"Detected {total} people")
+        logger.info(f"Detected {total} people in {room_name}")
 
         # 4. Save annotated image to disk
         try:
-            filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".jpg"
+            filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + f"_{room.get('id', 'default')}.jpg"
             cv2.imwrite(str(scan_dir / filename), annotated)
             logger.info(f"Saved: {scan_dir / filename}")
         except Exception as save_exc:
             logger.warning(f"Could not save scan image: {save_exc}")
 
-        # 5. Seat map (requires calibration)
+        # 5. Seat map (requires calibration — only for PTZ cameras)
         calibration = db.get_calibration()
         seat_states: dict = {}
-        if len(calibration) >= 4:
+        if camera_type != "rtsp" and len(calibration) >= 4:
             await _progress("Mapping seats…", 98)
             vb = _svg_viewbox()
             seat_states = det.map_detections_to_seats(detections, calibration, vb)
@@ -138,7 +152,8 @@ async def run_scan(service_type: str = "Manual"):
 
         # 6. Persist
         occupied = [k for k, v in seat_states.items() if v == "occupied"]
-        db.save_scan(ts, service_type, total, occupied, image_b64, raw_image_b64=raw_image_b64)
+        db.save_scan(ts, service_type, total, occupied, image_b64,
+                     raw_image_b64=raw_image_b64, room=room_name)
 
         # 7. Update shared state
         state.update(
@@ -157,11 +172,12 @@ async def run_scan(service_type: str = "Manual"):
             "count":          total,
             "timestamp":      ts,
             "service_type":   service_type,
+            "room":           room_name,
             "seat_states":    seat_states,
             "image_b64":      image_b64,
             "raw_image_b64":  raw_image_b64,
         })
-        logger.info(f"Scan done: {total} people  service={service_type}  ts={ts}")
+        logger.info(f"Scan done: {total} people  service={service_type}  room={room_name}  ts={ts}")
 
     except _ScanCancelledError:
         logger.info("Scan cancelled by user")
@@ -176,6 +192,28 @@ async def run_scan(service_type: str = "Manual"):
         if live_was_running:
             cam.start_live_capture()
             logger.info("Live view resumed")
+
+
+async def run_all_rooms_scan(service_type: str = "Manual"):
+    """Run scans across all configured rooms sequentially. Used by scheduler."""
+    settings = db.get_config("app_settings", {})
+    merged = {**_SETTINGS_DEFAULTS, **settings}
+    merged = _ensure_rooms(merged)
+    rooms = merged.get("rooms", [])
+
+    if not rooms:
+        logger.warning("No rooms configured — skipping scheduled scan")
+        return
+
+    for room in rooms:
+        if _scan_cancel.is_set():
+            break
+        room_id = room.get("id", "default")
+        logger.info(f"Scheduled scan: {service_type} — room {room.get('name', room_id)}")
+        await run_scan(service_type=service_type, room_id=room_id)
+        # Brief pause between rooms to let state settle
+        if len(rooms) > 1:
+            await asyncio.sleep(2)
 
 
 def _svg_viewbox():
@@ -193,7 +231,7 @@ def _svg_viewbox():
 @app.on_event("startup")
 async def _startup():
     db.init_db()
-    register_scan_callback(run_scan)
+    register_scan_callback(run_all_rooms_scan)
     sched = build_scheduler()
     sched.start()
     logger.info("Attendance counter ready ✓")
@@ -223,11 +261,11 @@ async def api_status():
 
 
 @app.post("/api/scan/trigger")
-async def api_trigger(service_type: str = "Manual"):
+async def api_trigger(service_type: str = "Manual", room_id: str = None):
     if state["running"]:
         raise HTTPException(409, "Scan already in progress")
-    asyncio.create_task(run_scan(service_type=service_type))
-    return {"status": "started", "service_type": service_type}
+    asyncio.create_task(run_scan(service_type=service_type, room_id=room_id))
+    return {"status": "started", "service_type": service_type, "room_id": room_id}
 
 
 @app.post("/api/scan/cancel")
@@ -346,16 +384,43 @@ async def api_clear_cal():
 
 
 # ── App settings ──────────────────────────────────────────────────────────────
-class AppSettings(BaseModel):
-    church_name:    Optional[str] = None
+class RoomConfig(BaseModel):
+    id:             Optional[str] = None
+    name:           Optional[str] = None
+    camera_type:    Optional[str] = None   # "ptz_optics" | "rtsp"
     camera_ip:      Optional[str] = None
     camera_user:    Optional[str] = None
     camera_pass:    Optional[str] = None
     scan_mode:      Optional[str] = None   # "preset" | "calibrated"
     preset_start:   Optional[int] = None
     preset_end:     Optional[int] = None
-    scan_positions: Optional[int] = None
+    rtsp_url:       Optional[str] = None
 
+
+class AppSettings(BaseModel):
+    church_name:    Optional[str]  = None
+    camera_ip:      Optional[str]  = None
+    camera_user:    Optional[str]  = None
+    camera_pass:    Optional[str]  = None
+    scan_mode:      Optional[str]  = None   # "preset" | "calibrated"
+    preset_start:   Optional[int]  = None
+    preset_end:     Optional[int]  = None
+    scan_positions: Optional[int]  = None
+    rooms:          Optional[list] = None
+
+
+_DEFAULT_ROOM = {
+    "id":           "default",
+    "name":         "Sanctuary",
+    "camera_type":  "ptz_optics",
+    "camera_ip":    "10.10.140.140",
+    "camera_user":  "admin",
+    "camera_pass":  "admin",
+    "scan_mode":    "preset",
+    "preset_start": 100,
+    "preset_end":   131,
+    "rtsp_url":     "",
+}
 
 _SETTINGS_DEFAULTS = {
     "church_name":    "Lakeshore Church",
@@ -369,10 +434,49 @@ _SETTINGS_DEFAULTS = {
 }
 
 
+def _ensure_rooms(settings: dict) -> dict:
+    """Ensure settings has a rooms array, migrating from flat camera fields if needed."""
+    if settings.get("rooms"):
+        return settings
+    # Migrate flat camera fields into a default room
+    room = {
+        "id":           "default",
+        "name":         "Sanctuary",
+        "camera_type":  "ptz_optics",
+        "camera_ip":    settings.get("camera_ip")    or _SETTINGS_DEFAULTS["camera_ip"],
+        "camera_user":  settings.get("camera_user")  or _SETTINGS_DEFAULTS["camera_user"],
+        "camera_pass":  settings.get("camera_pass")  or _SETTINGS_DEFAULTS["camera_pass"],
+        "scan_mode":    settings.get("scan_mode")     or _SETTINGS_DEFAULTS["scan_mode"],
+        "preset_start": settings.get("preset_start")  or _SETTINGS_DEFAULTS["preset_start"],
+        "preset_end":   settings.get("preset_end")    or _SETTINGS_DEFAULTS["preset_end"],
+        "rtsp_url":     "",
+    }
+    settings["rooms"] = [room]
+    return settings
+
+
+def _get_room(room_id: str = None) -> dict:
+    """Look up a room config by ID. Returns the first room if room_id is None."""
+    settings = db.get_config("app_settings", {})
+    merged = {**_SETTINGS_DEFAULTS, **settings}
+    merged = _ensure_rooms(merged)
+    rooms = merged.get("rooms", [])
+    if not rooms:
+        return {**_DEFAULT_ROOM}
+    if room_id is None:
+        return rooms[0]
+    for r in rooms:
+        if r.get("id") == room_id:
+            return r
+    return rooms[0]
+
+
 @app.get("/api/settings")
 async def api_get_settings():
     saved = db.get_config("app_settings", {})
-    return {**_SETTINGS_DEFAULTS, **saved}
+    merged = {**_SETTINGS_DEFAULTS, **saved}
+    merged = _ensure_rooms(merged)
+    return merged
 
 
 @app.post("/api/settings")
@@ -381,7 +485,9 @@ async def api_save_settings(body: AppSettings):
     patch = body.model_dump(exclude_none=True)
     existing.update(patch)
     db.set_config("app_settings", existing)
-    return {**_SETTINGS_DEFAULTS, **existing}
+    merged = {**_SETTINGS_DEFAULTS, **existing}
+    merged = _ensure_rooms(merged)
+    return merged
 
 
 # ── Camera bounds (individual pan/tilt edges + scan zoom) ─────────────────────

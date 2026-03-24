@@ -6,8 +6,10 @@ export async function getImage()       { return _get('/api/scan/image') }
 export async function getCalibration() { return _get('/api/calibration') }
 export async function getCapture()     { return _get('/api/capture') }
 
-export async function triggerScan(serviceType = 'Manual') {
-  return _post(`/api/scan/trigger?service_type=${encodeURIComponent(serviceType)}`)
+export async function triggerScan(serviceType = 'Manual', roomId = null) {
+  let url = `/api/scan/trigger?service_type=${encodeURIComponent(serviceType)}`
+  if (roomId) url += `&room_id=${encodeURIComponent(roomId)}`
+  return _post(url)
 }
 export async function cancelScan() {
   return _post('/api/scan/cancel')

@@ -27,6 +27,7 @@ def init_db():
         "ALTER TABLE scans ADD COLUMN manual_add INTEGER DEFAULT 0",
         "ALTER TABLE scans ADD COLUMN archived  INTEGER DEFAULT 0",
         "ALTER TABLE scans ADD COLUMN raw_image  TEXT",
+        "ALTER TABLE scans ADD COLUMN room TEXT",
     ]:
         try:
             c.execute(migration)
@@ -75,12 +76,12 @@ def set_config(key: str, value):
     conn.close()
 
 
-def save_scan(timestamp, service_type, total_count, occupied_seats, stitched_image_b64, notes=None, raw_image_b64=None):
+def save_scan(timestamp, service_type, total_count, occupied_seats, stitched_image_b64, notes=None, raw_image_b64=None, room=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO scans (timestamp, service_type, total_count, occupied_seats, stitched_image, notes, raw_image) VALUES (?,?,?,?,?,?,?)",
-        (timestamp, service_type, total_count, json.dumps(occupied_seats), stitched_image_b64, notes, raw_image_b64),
+        "INSERT INTO scans (timestamp, service_type, total_count, occupied_seats, stitched_image, notes, raw_image, room) VALUES (?,?,?,?,?,?,?,?)",
+        (timestamp, service_type, total_count, json.dumps(occupied_seats), stitched_image_b64, notes, raw_image_b64, room),
     )
     scan_id = c.lastrowid
     conn.commit()
@@ -94,7 +95,7 @@ def get_all_scans(include_archived: bool = False):
     where = "" if include_archived else "WHERE COALESCE(archived, 0) = 0"
     c.execute(
         f"SELECT id, timestamp, service_type, total_count, occupied_seats, notes, "
-        f"COALESCE(manual_add, 0), COALESCE(archived, 0) FROM scans {where} ORDER BY timestamp ASC"
+        f"COALESCE(manual_add, 0), COALESCE(archived, 0), room FROM scans {where} ORDER BY timestamp ASC"
     )
     rows = c.fetchall()
     conn.close()
@@ -109,6 +110,7 @@ def get_all_scans(include_archived: bool = False):
             "manual_add":    r[6],
             "total":         (r[3] or 0) + (r[6] or 0),
             "archived":      bool(r[7]),
+            "room":          r[8],
         }
         for r in rows
     ]

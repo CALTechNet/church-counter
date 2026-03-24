@@ -43,6 +43,8 @@ export default function App() {
   const [toast, setToast]         = useState(null)
   const [ptzPos, setPtzPos]       = useState(null)
   const [churchName, setChurchName] = useState('Lakeshore Church')
+  const [rooms, setRooms]         = useState([])
+  const [selectedRoom, setSelectedRoom] = useState(null)
 
   const showToast = (msg, color = C.green) => {
     setToast({ msg, color })
@@ -61,6 +63,10 @@ export default function App() {
     }).catch(() => {})
     getSettings().then(s => {
       if (s.church_name) setChurchName(s.church_name)
+      if (s.rooms && s.rooms.length > 0) {
+        setRooms(s.rooms)
+        setSelectedRoom(s.rooms[0].id)
+      }
     }).catch(() => {})
   }, [])
 
@@ -84,7 +90,7 @@ export default function App() {
           setImageB64(msg.image_b64)
           setRawImageB64(msg.raw_image_b64 ?? null)
           setZoomImageB64(msg.zoom_image_b64)
-          showToast(`Scan complete — ${msg.count} people detected`)
+          showToast(`Scan complete${msg.room ? ` (${msg.room})` : ''} — ${msg.count} people detected`)
         } else if (msg.type === 'scan_cancelled') {
           setScanState({ running: false, progress: 0, message: 'Cancelled' })
           setScanStartedAt(null)
@@ -120,7 +126,7 @@ export default function App() {
 
   const handleScan = async () => {
     try {
-      await triggerScan(serviceType)
+      await triggerScan(serviceType, rooms.length > 1 ? selectedRoom : null)
     } catch (e) {
       showToast(e.message, C.red)
     }
@@ -188,6 +194,17 @@ export default function App() {
           >
             {SERVICE_TYPES.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
+
+          {rooms.length > 1 && (
+            <select
+              value={selectedRoom || ''}
+              onChange={e => setSelectedRoom(e.target.value)}
+              disabled={scanState.running}
+              style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, borderRadius: 6, padding: '6px 8px', fontSize: 12, cursor: 'pointer', flex: isMobile ? '1 1 auto' : '0 0 auto' }}
+            >
+              {rooms.map(r => <option key={r.id} value={r.id}>{r.name || r.id}</option>)}
+            </select>
+          )}
 
           <button
             onClick={handleScan}
@@ -274,7 +291,15 @@ export default function App() {
       {showSettings && (
         <SettingsModal
           onClose={() => setShowSettings(false)}
-          onSave={s => { if (s.church_name) setChurchName(s.church_name) }}
+          onSave={s => {
+            if (s.church_name) setChurchName(s.church_name)
+            if (s.rooms && s.rooms.length > 0) {
+              setRooms(s.rooms)
+              if (!s.rooms.find(r => r.id === selectedRoom)) {
+                setSelectedRoom(s.rooms[0].id)
+              }
+            }
+          }}
         />
       )}
 
