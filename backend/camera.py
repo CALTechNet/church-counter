@@ -121,6 +121,50 @@ async def go_home():
     logger.info("Camera returned to home position")
 
 
+# ── Preset position learning ───────────────────────────────────────────────────
+
+async def learn_preset_positions(
+    progress_callback: Optional[ProgressCB] = None,
+) -> dict:
+    """Visit each scan preset, wait for the camera to settle, then record its
+    pan/tilt position.  Results are stored in the DB under 'preset_positions'
+    so that _preset_scan can drive them with move_abs at maximum speed instead
+    of relying on the camera's internal preset-recall speed.
+
+    Returns a dict mapping str(preset_id) -> {"pan": int, "tilt": int}.
+    """
+    import database as db
+
+    positions: dict = {}
+    total = len(SCAN_PRESETS)
+
+    async def prog(msg: str, pct: int):
+        logger.info(f"[{pct:3d}%] {msg}")
+        if progress_callback:
+            await progress_callback(msg, pct)
+
+    await prog("Starting preset position learning…", 0)
+
+    for idx, preset_id in enumerate(SCAN_PRESETS):
+        pct = int((idx / total) * 95)
+        await prog(f"Learning preset {preset_id} ({idx + 1}/{total})…", pct)
+        await call_preset(preset_id)
+        # Wait for the camera to finish moving before querying position
+        await asyncio.sleep(TRAVEL_TIME + SETTLE_TIME + 0.3)
+        pos = await asyncio.to_thread(_get_position_sync)
+        if pos["pan"] is not None and pos["tilt"] is not None:
+            positions[str(preset_id)] = {"pan": pos["pan"], "tilt": pos["tilt"]}
+            logger.debug(f"  preset {preset_id}: pan={pos['pan']}, tilt={pos['tilt']}")
+        else:
+            logger.warning(f"  Could not read position for preset {preset_id}")
+
+    db.set_config("preset_positions", positions)
+    await go_home()
+    await prog(f"Done — learned {len(positions)}/{total} preset positions", 100)
+    logger.info(f"learn_preset_positions: stored {len(positions)} positions")
+    return positions
+
+
 # ── Absolute PTZ move (VISCA) ─────────────────────────────────────────────────
 
 def _encode_visca_pos(v: int) -> list:
@@ -134,7 +178,7 @@ def _encode_visca_pos(v: int) -> list:
     ]
 
 
-def _move_abs_sync(pan: int, tilt: int, pan_speed: int = 6, tilt_speed: int = 6):
+def _move_abs_sync(pan: int, tilt: int, pan_speed: int = 24, tilt_speed: int = 20):
     """VISCA 8x 01 06 02 VV WW [pan×4] [tilt×4] FF — blocking."""
     p = _encode_visca_pos(pan)
     t = _encode_visca_pos(tilt)
@@ -148,7 +192,7 @@ def _move_abs_sync(pan: int, tilt: int, pan_speed: int = 6, tilt_speed: int = 6)
         logger.warning(f"VISCA absolute move failed: {exc}")
 
 
-async def move_abs(pan: int, tilt: int, pan_speed: int = 6, tilt_speed: int = 6):
+async def move_abs(pan: int, tilt: int, pan_speed: int = 24, tilt_speed: int = 20):
     """Move camera to absolute pan/tilt position."""
     await asyncio.to_thread(_move_abs_sync, pan, tilt, pan_speed, tilt_speed)
     logger.debug(f"VISCA absolute move pan={pan} tilt={tilt}")
@@ -370,7 +414,17 @@ async def _preset_scan(
     cancel_event=None,
 ) -> List[np.ndarray]:
     """Visit a list of VISCA presets, capturing one frame immediately after each move.
-    Navigates to the first preset and waits 1.5s to settle before scanning."""
+    Navigates to the first preset and waits 1.5s to settle before scanning.
+    If preset positions have been learned (via learn_preset_positions), uses
+    move_abs at maximum speed instead of preset recall for faster traversal."""
+    import database as db
+    preset_positions = db.get_config("preset_positions", {})
+    using_abs = bool(preset_positions)
+    if using_abs:
+        logger.info("Preset scan: using learned positions with move_abs (max speed)")
+    else:
+        logger.info("Preset scan: using preset recall (run learn-presets for faster movement)")
+
     frames: List[np.ndarray] = []
     total = len(presets)
 
@@ -382,6 +436,14 @@ async def _preset_scan(
     def cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
 
+    async def goto_preset(preset_id: int):
+        """Move to a preset using absolute positioning if known, else preset recall."""
+        pos = preset_positions.get(str(preset_id))
+        if pos:
+            await move_abs(pos["pan"], pos["tilt"])
+        else:
+            await call_preset(preset_id)
+
     await prog("Starting preset scan…", 0)
 
     if not presets:
@@ -389,7 +451,7 @@ async def _preset_scan(
 
     # Go to first preset and wait for camera to settle
     await prog(f"Moving to first preset {presets[0]}…", 0)
-    await call_preset(presets[0])
+    await goto_preset(presets[0])
     await asyncio.sleep(3.0)
 
     if cancelled():
@@ -406,7 +468,7 @@ async def _preset_scan(
         if cancelled():
             return frames
         pct = int((i / total) * 88)
-        await call_preset(preset_id)
+        await goto_preset(preset_id)
         await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0

@@ -510,6 +510,15 @@ async def api_ptz_goto_bound(corner: str = "top_left"):
     return {"status": "ok", "corner": corner, "pan": pan, "tilt": tilt, "zoom": zoom}
 
 
+@app.post("/api/ptz/learn-presets")
+async def api_ptz_learn_presets():
+    """Visit every scan preset, record its pan/tilt position, and save to DB.
+    After this runs, preset scans will use move_abs at maximum speed instead
+    of relying on the camera's internal preset-recall speed."""
+    positions = await cam.learn_preset_positions()
+    return {"status": "ok", "learned": len(positions), "positions": positions}
+
+
 @app.post("/api/ptz/{action}")
 async def api_ptz(action: str, speed: int = 10):
     fn = PTZ_ACTIONS.get(action.lower())
