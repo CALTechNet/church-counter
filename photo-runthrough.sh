@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCAN_DIR="/etc/church-counter/data/scans"
+SCAN_DIR="${DATA_DIR:-/opt/church-counter/data}/scans"
 
 echo ""
 echo "========================================="
@@ -63,8 +63,10 @@ import cv2
 import detector as det
 import database as db
 
-input_path  = '/data/scans/$filename'
-output_path = '/data/scans/$test_filename'
+import os as _os
+data_dir    = _os.environ.get('DATA_DIR', '/opt/church-counter/data')
+input_path  = f'{data_dir}/scans/$filename'
+output_path = f'{data_dir}/scans/$test_filename'
 
 print("Loading image...")
 sys.stdout.flush()

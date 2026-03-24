@@ -1,9 +1,10 @@
 """
-Lakeshore Church — Attendance Counter API
+Church Attendance Counter API
 FastAPI + APScheduler, single container.
 """
 import asyncio
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -27,10 +28,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SVG_PATH = Path("/config/seats.svg")
-FRONTEND_DIR = Path("/frontend/build")
+_DATA_DIR   = Path(os.environ.get("DATA_DIR",   "/opt/church-counter/data"))
+_CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/opt/church-counter/config"))
+SVG_PATH     = _CONFIG_DIR / "seats.svg"
+FRONTEND_DIR = Path(os.environ.get("FRONTEND_DIR", "/frontend/build"))
 
-app = FastAPI(title="Lakeshore Church Attendance Counter", version="1.0.0")
+app = FastAPI(title="Church Attendance Counter", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -84,7 +87,7 @@ async def run_scan(service_type: str = "Manual"):
 
     try:
         import cv2
-        scan_dir = Path("/data/scans")
+        scan_dir = _DATA_DIR / "scans"
         scan_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Capture
@@ -341,6 +344,8 @@ class AppSettings(BaseModel):
     camera_ip:      Optional[str] = None
     camera_user:    Optional[str] = None
     camera_pass:    Optional[str] = None
+    camera_type:    Optional[str] = None   # "visca_ptz" | future types
+    rtsp_url:       Optional[str] = None
     scan_mode:      Optional[str] = None   # "preset" | "calibrated"
     preset_start:   Optional[int] = None
     preset_end:     Optional[int] = None
@@ -348,10 +353,12 @@ class AppSettings(BaseModel):
 
 
 _SETTINGS_DEFAULTS = {
-    "church_name":    "Lakeshore Church",
-    "camera_ip":      "10.10.140.140",
-    "camera_user":    "admin",
-    "camera_pass":    "admin",
+    "church_name":    os.environ.get("CHURCH_NAME", "My Church"),
+    "camera_ip":      os.environ.get("CAMERA_IP", "192.168.1.100"),
+    "camera_user":    os.environ.get("CAMERA_USER", "admin"),
+    "camera_pass":    os.environ.get("CAMERA_PASS", "admin"),
+    "camera_type":    os.environ.get("CAMERA_TYPE", "visca_ptz"),
+    "rtsp_url":       os.environ.get("RTSP_URL", ""),
     "scan_mode":      "preset",
     "preset_start":   100,
     "preset_end":     131,

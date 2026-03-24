@@ -4,17 +4,38 @@ version: "3.9"
 services:
   attendance:
     build: .
+    image: church-counter:latest
     container_name: church-attendance
     restart: unless-stopped
     ports:
       - "80:8000"
     volumes:
-      - ./data:/data          # SQLite database — persists between restarts
-      - ./config:/config      # Drop your seats.svg here
-      - ./models:/models      # Persisted YOLO model weights (incl. OpenVINO export)
+      # Persistent data — survives image rebuilds; never overwritten on update
+      - /opt/church-counter/data:/opt/church-counter/data
+      # Drop your custom seats.svg here; falls back to built-in placeholder
+      - /opt/church-counter/config:/opt/church-counter/config
+      # Optional: place pre-exported YOLO/OpenVINO model weights here
+      - /opt/church-counter/models:/opt/church-counter/models
     environment:
       - PYTHONUNBUFFERED=1
+      # ── Timezone ──────────────────────────────────────────────────────────
       - TZ=America/Chicago
-    network_mode: bridge      # Must reach camera at 10.10.140.140
+      # ── Paths (match volume mounts above) ─────────────────────────────────
+      - DATA_DIR=/opt/church-counter/data
+      - CONFIG_DIR=/opt/church-counter/config
+      - MODELS_DIR=/opt/church-counter/models
+      # ── Church identity ────────────────────────────────────────────────────
+      # Shown in the UI header; change to your church name
+      - CHURCH_NAME=My Church
+      # ── Camera (PTZ Optics / VISCA-over-TCP) ──────────────────────────────
+      # Override these if your camera IP or credentials differ from defaults
+      # saved in the database — env vars are only used when no DB value exists
+      - CAMERA_IP=192.168.1.100
+      - CAMERA_USER=admin
+      - CAMERA_PASS=admin
+      - CAMERA_TYPE=visca_ptz
+      # RTSP_URL is auto-derived from CAMERA_IP if left blank
+      # - RTSP_URL=rtsp://192.168.1.100:554/1
+    network_mode: bridge
     extra_hosts:
       - "host.docker.internal:host-gateway"

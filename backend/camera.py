@@ -1,13 +1,13 @@
 """
-PTZ Optics camera control for Lakeshore Church attendance scanner.
-Camera: 10.10.140.140, ceiling center-stage, looking out at congregation.
+PTZ camera control for the Church Attendance Counter.
+Default driver: PTZ Optics / Sony VISCA-over-TCP (port 5678).
 Scan pattern: presets (100-131) in a zigzag grid, left-to-right.
 Captures frames continuously during camera movement for denser coverage.
-Uses VISCA over TCP (port 5678) for PTZ control.
 """
 import asyncio
 import logging
 import math
+import os
 import socket
 import threading
 import time
@@ -18,10 +18,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Default / fallback values (overridden by DB settings at runtime)
-CAMERA_IP  = "10.10.140.140"
+# Default / fallback values — env vars are used when no DB setting exists yet
+CAMERA_IP  = os.environ.get("CAMERA_IP", "192.168.1.100")
 VISCA_PORT = 5678
-RTSP_URL   = f"rtsp://{CAMERA_IP}:554/1"
+RTSP_URL   = os.environ.get("RTSP_URL", "") or f"rtsp://{CAMERA_IP}:554/1"
 
 # ── Scan presets — zigzag grid 100–131 ───────────────────────────────────────
 SCAN_PRESETS = list(range(100, 132))

@@ -1,7 +1,9 @@
 """
-APScheduler — three weekly scheduled scans (America/Chicago).
+APScheduler — weekly scheduled scans.
+Timezone defaults to TZ env var (set in docker-compose) or America/Chicago.
 """
 import logging
+import os
 from typing import Callable, Awaitable, Optional
 
 import pytz
@@ -10,7 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 logger = logging.getLogger(__name__)
 
-TZ = pytz.timezone("America/Chicago")
+TZ = pytz.timezone(os.environ.get("TZ", "America/Chicago"))
 _scheduler: Optional[AsyncIOScheduler] = None
 _scan_cb: Optional[Callable] = None
 
