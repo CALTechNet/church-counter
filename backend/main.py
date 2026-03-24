@@ -416,6 +416,21 @@ async def api_ptz_position():
     return await cam.get_position()
 
 
+@app.post("/api/ptz/goto-bound")
+async def api_ptz_goto_bound(corner: str = "top_left"):
+    """Move camera to the saved top_left or bottom_right bound position."""
+    bounds = db.get_config("camera_bounds", {})
+    pos = bounds.get(corner)
+    if not pos:
+        raise HTTPException(404, f"No bound saved for corner: {corner}")
+    pan  = int(pos["pan"])
+    tilt = int(pos["tilt"])
+    zoom = int(pos.get("zoom") or bounds.get("zoom") or 10000)
+    await cam.move_abs(pan, tilt)
+    await cam.zoom_abs(zoom)
+    return {"status": "ok", "corner": corner, "pan": pan, "tilt": tilt, "zoom": zoom}
+
+
 @app.post("/api/ptz/{action}")
 async def api_ptz(action: str, speed: int = 10):
     fn = PTZ_ACTIONS.get(action.lower())

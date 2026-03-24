@@ -21,6 +21,9 @@ export async function clearCalibration() {
 export async function ptzCommand(action, speed = 10) {
   return _post(`/api/ptz/${action}?speed=${speed}`)
 }
+export async function gotoBound(corner) {
+  return _post(`/api/ptz/goto-bound?corner=${encodeURIComponent(corner)}`)
+}
 export async function getPtzPosition()  { return _get('/api/ptz/position') }
 export async function getCameraBounds() { return _get('/api/camera-bounds') }
 export async function saveCameraBounds(bounds) { return _post('/api/camera-bounds', bounds) }
