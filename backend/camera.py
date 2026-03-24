@@ -144,6 +144,63 @@ async def get_position() -> dict:
     return await asyncio.to_thread(_get_position_sync)
 
 
+# ── Continuous movement (VISCA Pan-Tilt Drive + Zoom) ────────────────────────
+# VISCA Pan-Tilt Drive: 81 01 06 01 VV WW PP TT FF
+#   VV = pan speed 0x01-0x18, WW = tilt speed 0x01-0x14
+#   PP: 01=right 02=left 03=stop   TT: 01=up 02=down 03=stop
+# VISCA Zoom: 81 01 04 07 pq FF
+#   pq: 00=stop, 2s=tele(in) s=1-7, 3s=wide(out) s=1-7
+
+def _ptz_drive_sync(pan_dir: int, tilt_dir: int, pan_speed: int, tilt_speed: int):
+    pan_v  = max(1, min(0x18, pan_speed))
+    tilt_v = max(1, min(0x14, tilt_speed))
+    cmd = bytes([0x81, 0x01, 0x06, 0x01, pan_v, tilt_v, pan_dir, tilt_dir, 0xFF])
+    try:
+        s = _visca_connect()
+        _visca_send(s, cmd)
+        s.close()
+    except Exception as exc:
+        logger.warning(f"VISCA ptz-drive failed: {exc}")
+
+
+def _zoom_sync(direction: int, speed: int):
+    # direction: 0x20=in, 0x30=out, 0x00=stop
+    spd_nibble = max(1, min(7, speed)) if direction else 0
+    pq = direction | spd_nibble
+    cmd = bytes([0x81, 0x01, 0x04, 0x07, pq, 0xFF])
+    try:
+        s = _visca_connect()
+        _visca_send(s, cmd)
+        s.close()
+    except Exception as exc:
+        logger.warning(f"VISCA zoom failed: {exc}")
+
+
+async def pan_left(speed: int = 8):
+    await asyncio.to_thread(_ptz_drive_sync, 0x02, 0x03, speed, 1)
+
+async def pan_right(speed: int = 8):
+    await asyncio.to_thread(_ptz_drive_sync, 0x01, 0x03, speed, 1)
+
+async def tilt_up(speed: int = 8):
+    await asyncio.to_thread(_ptz_drive_sync, 0x03, 0x01, 1, speed)
+
+async def tilt_down(speed: int = 8):
+    await asyncio.to_thread(_ptz_drive_sync, 0x03, 0x02, 1, speed)
+
+async def stop():
+    await asyncio.to_thread(_ptz_drive_sync, 0x03, 0x03, 1, 1)
+
+async def zoom_in(speed: int = 4):
+    await asyncio.to_thread(_zoom_sync, 0x20, speed)
+
+async def zoom_out(speed: int = 4):
+    await asyncio.to_thread(_zoom_sync, 0x30, speed)
+
+async def zoom_stop():
+    await asyncio.to_thread(_zoom_sync, 0x00, 0)
+
+
 # ── Frame capture ─────────────────────────────────────────────────────────────
 def capture_frame(url: str = RTSP_URL) -> Optional[np.ndarray]:
     """Open RTSP stream, flush buffer, return latest frame."""
