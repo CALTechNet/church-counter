@@ -1,7 +1,7 @@
 """
 PTZ Optics camera control for Lakeshore Church attendance scanner.
 Camera: 10.10.140.140, ceiling center-stage, looking out at congregation.
-Scan pattern: presets (100-131) in a zigzag grid, left-to-right.
+Scan pattern: presets (100-131) in a vertical-S grid, top-to-bottom per column.
 Captures frames continuously during camera movement for denser coverage.
 Uses VISCA over TCP (port 5678) for PTZ control.
 """
@@ -464,24 +464,26 @@ async def _calibrated_scan(
     zoom = int(bounds.get("zoom") or 10000)
     zoom = max(1, zoom)
 
-    # At zoom=10000 each photo covers ~75 pan/tilt units
-    pan_step  = max(1, int(75 * 10000 / zoom))
-    tilt_step = max(1, int(75 * 10000 / zoom))
+    # At zoom=10000 each photo covers ~150 pan/tilt units
+    pan_step  = max(1, int(150 * 10000 / zoom))
+    tilt_step = max(1, int(150 * 10000 / zoom))
     pan_range  = abs(pan_br  - pan_tl)
     tilt_range = abs(tilt_br - tilt_tl)
     cols = max(1, math.ceil(pan_range  / pan_step)  + 1)
     rows = max(1, math.ceil(tilt_range / tilt_step) + 1)
 
-    # Build position list in a reverse-S (boustrophedon) pattern:
-    # even rows go left-to-right, odd rows go right-to-left
+    # Build position list in a vertical-S (column-major boustrophedon) pattern:
+    # matches the preset scan order — start top-left, go top-to-bottom down each
+    # column, shift right to the next column, then alternate direction.
+    # Even columns go top→bottom, odd columns go bottom→top.
     positions: List[tuple] = []
-    for row in range(rows):
-        tilt_frac = row / max(rows - 1, 1)
-        tilt = int(tilt_tl + (tilt_br - tilt_tl) * tilt_frac)
-        col_range = range(cols) if row % 2 == 0 else range(cols - 1, -1, -1)
-        for col in col_range:
-            pan_frac = col / max(cols - 1, 1)
-            pan = int(pan_tl + (pan_br - pan_tl) * pan_frac)
+    for col in range(cols):
+        pan_frac = col / max(cols - 1, 1)
+        pan = int(pan_tl + (pan_br - pan_tl) * pan_frac)
+        row_range = range(rows) if col % 2 == 0 else range(rows - 1, -1, -1)
+        for row in row_range:
+            tilt_frac = row / max(rows - 1, 1)
+            tilt = int(tilt_tl + (tilt_br - tilt_tl) * tilt_frac)
             positions.append((pan, tilt))
 
     frames: List[np.ndarray] = []
