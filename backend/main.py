@@ -315,6 +315,31 @@ async def api_clear_cal():
     return {"status": "cleared"}
 
 
+# ── Camera bounds (top-left / bottom-right scan corners) ─────────────────────
+class CameraBounds(BaseModel):
+    top_left:     Optional[dict] = None   # {pan, tilt, zoom}
+    bottom_right: Optional[dict] = None   # {pan, tilt, zoom}
+    zoom:         Optional[int]  = None
+
+
+@app.get("/api/camera-bounds")
+async def api_get_bounds():
+    return db.get_config("camera_bounds", {"top_left": None, "bottom_right": None, "zoom": None})
+
+
+@app.post("/api/camera-bounds")
+async def api_save_bounds(bounds: CameraBounds):
+    existing = db.get_config("camera_bounds", {})
+    if bounds.top_left is not None:
+        existing["top_left"] = bounds.top_left
+    if bounds.bottom_right is not None:
+        existing["bottom_right"] = bounds.bottom_right
+    if bounds.zoom is not None:
+        existing["zoom"] = bounds.zoom
+    db.set_config("camera_bounds", existing)
+    return existing
+
+
 # ── Camera snapshot (for calibration wizard) ──────────────────────────────────
 @app.get("/api/capture")
 async def api_capture():
