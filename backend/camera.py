@@ -144,6 +144,68 @@ async def get_position() -> dict:
     return await asyncio.to_thread(_get_position_sync)
 
 
+# ── Manual pan/tilt/zoom control ─────────────────────────────────────────────
+
+def _pan_tilt_sync(pan_dir: int, tilt_dir: int, pan_speed: int = 8, tilt_speed: int = 8):
+    """Send a VISCA Pan-Tilt Drive command (blocking).
+    pan_dir:  0x01=left, 0x02=right, 0x03=stop
+    tilt_dir: 0x01=up,   0x02=down,  0x03=stop
+    """
+    pan_speed  = max(1, min(24, pan_speed))
+    tilt_speed = max(1, min(20, tilt_speed))
+    cmd = bytes([0x81, 0x01, 0x06, 0x01,
+                 pan_speed, tilt_speed,
+                 pan_dir, tilt_dir, 0xFF])
+    try:
+        s = _visca_connect()
+        _visca_send(s, cmd)
+        s.close()
+    except Exception as exc:
+        logger.warning(f"VISCA pan/tilt failed: {exc}")
+
+
+async def pan_left(speed: int = 8):
+    await asyncio.to_thread(_pan_tilt_sync, 0x01, 0x03, speed, speed)
+
+async def pan_right(speed: int = 8):
+    await asyncio.to_thread(_pan_tilt_sync, 0x02, 0x03, speed, speed)
+
+async def tilt_up(speed: int = 8):
+    await asyncio.to_thread(_pan_tilt_sync, 0x03, 0x01, speed, speed)
+
+async def tilt_down(speed: int = 8):
+    await asyncio.to_thread(_pan_tilt_sync, 0x03, 0x02, speed, speed)
+
+async def stop():
+    """Stop all pan/tilt movement."""
+    await asyncio.to_thread(_pan_tilt_sync, 0x03, 0x03)
+
+
+def _zoom_sync(direction: int, speed: int = 4):
+    """Send a VISCA Zoom command (blocking).
+    direction: 0x20=tele (in), 0x30=wide (out), 0x00=stop
+    """
+    speed = max(0, min(7, speed))
+    zoom_byte = direction | (speed if direction != 0x00 else 0)
+    cmd = bytes([0x81, 0x01, 0x04, 0x07, zoom_byte, 0xFF])
+    try:
+        s = _visca_connect()
+        _visca_send(s, cmd)
+        s.close()
+    except Exception as exc:
+        logger.warning(f"VISCA zoom failed: {exc}")
+
+
+async def zoom_in(speed: int = 4):
+    await asyncio.to_thread(_zoom_sync, 0x20, speed)
+
+async def zoom_out(speed: int = 4):
+    await asyncio.to_thread(_zoom_sync, 0x30, speed)
+
+async def zoom_stop():
+    await asyncio.to_thread(_zoom_sync, 0x00, 0)
+
+
 # ── Frame capture ─────────────────────────────────────────────────────────────
 def capture_frame(url: str = RTSP_URL) -> Optional[np.ndarray]:
     """Open RTSP stream, flush buffer, return latest frame."""
