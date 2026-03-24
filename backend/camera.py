@@ -301,10 +301,11 @@ async def _preset_scan(
     presets: List[int],
     progress_callback: Optional[ProgressCB] = None,
 ) -> List[np.ndarray]:
-    """Visit a list of VISCA presets, capturing frames continuously during each move."""
+    """Visit a list of VISCA presets, issuing each move 300ms apart and capturing
+    frames continuously during every travel window (including intermediary frames).
+    Navigates to the first preset and waits 1.5s to settle before scanning."""
     frames: List[np.ndarray] = []
     total = len(presets)
-    capture_window = TRAVEL_TIME + SETTLE_TIME
 
     async def prog(msg: str, pct: int):
         logger.info(f"[{pct:3d}%] {msg}")
@@ -313,18 +314,31 @@ async def _preset_scan(
 
     await prog("Starting preset scan…", 0)
 
-    for i, preset_id in enumerate(presets):
+    if not presets:
+        return frames
+
+    # Go to first preset and wait for camera to settle
+    await prog(f"Moving to first preset {presets[0]}…", 0)
+    await call_preset(presets[0])
+    await asyncio.sleep(1.5)
+
+    # Capture frames during the settle window at first preset
+    f = await asyncio.to_thread(capture_frame)
+    if f is not None:
+        frames.append(f)
+    await prog(f"Preset {presets[0]} (1/{total}) — {len(frames)} total", 0)
+
+    # Move through remaining presets; capture all frames possible in each 300ms window
+    for i, preset_id in enumerate(presets[1:], 1):
         pct = int((i / total) * 88)
         await call_preset(preset_id)
-
-        deadline = time.monotonic() + capture_window
+        deadline = time.monotonic() + 0.3
         frames_this = 0
         while time.monotonic() < deadline:
             f = await asyncio.to_thread(capture_frame)
             if f is not None:
                 frames.append(f)
                 frames_this += 1
-            await asyncio.sleep(CAPTURE_INTERVAL)
 
         await prog(
             f"Preset {preset_id} ({i+1}/{total}) — {frames_this} frames, {len(frames)} total",
@@ -370,13 +384,12 @@ async def _calibrated_scan(
     cols = max(1, math.ceil(pan_range  / pan_step)  + 1)
     rows = max(1, math.ceil(tilt_range / tilt_step) + 1)
 
-    # Build zigzag position list (left→right on even rows, right→left on odd)
+    # Build position list left-to-right for every row (top to bottom)
     positions: List[tuple] = []
     for row in range(rows):
         tilt_frac = row / max(rows - 1, 1)
         tilt = int(tilt_tl + (tilt_br - tilt_tl) * tilt_frac)
-        col_range = range(cols) if row % 2 == 0 else range(cols - 1, -1, -1)
-        for col in col_range:
+        for col in range(cols):
             pan_frac = col / max(cols - 1, 1)
             pan = int(pan_tl + (pan_br - pan_tl) * pan_frac)
             positions.append((pan, tilt))
@@ -391,19 +404,32 @@ async def _calibrated_scan(
 
     await prog(f"Starting calibrated scan ({rows}×{cols} grid, {total} positions)…", 0)
 
-    for i, (pan, tilt) in enumerate(positions):
+    if not positions:
+        return frames
+
+    # Go to top-left (first position) and wait for camera to settle
+    pan0, tilt0 = positions[0]
+    await prog(f"Moving to top-left (pan={pan0}, tilt={tilt0})…", 0)
+    await move_abs(pan0, tilt0)
+    await asyncio.sleep(1.5)
+
+    # Capture frames during the settle window at top-left
+    f = await asyncio.to_thread(capture_frame)
+    if f is not None:
+        frames.append(f)
+    await prog(f"Position 1/{total} (pan={pan0}, tilt={tilt0}) — {len(frames)} total", 0)
+
+    # Move through remaining positions; capture all frames possible in each 300ms window
+    for i, (pan, tilt) in enumerate(positions[1:], 1):
         pct = int((i / total) * 88)
         await move_abs(pan, tilt)
-        await asyncio.sleep(TRAVEL_TIME + SETTLE_TIME)
-
-        deadline = time.monotonic() + 0.6
+        deadline = time.monotonic() + 0.3
         frames_this = 0
         while time.monotonic() < deadline:
             f = await asyncio.to_thread(capture_frame)
             if f is not None:
                 frames.append(f)
                 frames_this += 1
-            await asyncio.sleep(CAPTURE_INTERVAL)
 
         await prog(
             f"Position {i+1}/{total} (pan={pan}, tilt={tilt}) — {frames_this} frames, {len(frames)} total",
