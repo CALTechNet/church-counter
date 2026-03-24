@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { getSettings, saveSettings } from '../api.js'
+import { getSettings, saveSettings, getCameraBounds } from '../api.js'
 
 const C = {
   bg:      '#0f172a',
@@ -20,21 +20,24 @@ const field        = { marginBottom: 12 }
 
 export default function SettingsModal({ onClose, onSave }) {
   const [cfg, setCfg] = useState({
-    church_name:    'Lakeshore Church',
-    camera_ip:      '10.10.140.140',
-    camera_user:    'admin',
-    camera_pass:    'admin',
-    scan_mode:      'preset',
-    preset_start:   100,
-    preset_end:     131,
-    scan_positions: 24,
+    church_name:  'Lakeshore Church',
+    camera_ip:    '10.10.140.140',
+    camera_user:  'admin',
+    camera_pass:  'admin',
+    scan_mode:    'preset',
+    preset_start: 100,
+    preset_end:   131,
   })
-  const [saving, setSaving] = useState(false)
-  const [msg,    setMsg]    = useState(null)
+  const [saving, setSaving]       = useState(false)
+  const [msg,    setMsg]          = useState(null)
+  const [bounds, setBounds]       = useState(null)
 
   useEffect(() => {
     getSettings()
       .then(s => setCfg(prev => ({ ...prev, ...s })))
+      .catch(() => {})
+    getCameraBounds()
+      .then(b => setBounds(b))
       .catch(() => {})
   }, [])
 
@@ -57,10 +60,14 @@ export default function SettingsModal({ onClose, onSave }) {
   const presetCount = Math.max(0, (cfg.preset_end ?? 131) - (cfg.preset_start ?? 100) + 1)
 
   const calGrid = (() => {
-    const n    = Math.max(4, cfg.scan_positions ?? 24)
-    const cols = Math.max(1, Math.round(Math.sqrt(n * 1.78)))
-    const rows = Math.max(1, Math.round(n / cols))
-    return { cols, rows }
+    const tl = bounds?.top_left
+    const br = bounds?.bottom_right
+    if (!tl || !br) return null
+    const zoom     = Math.max(1, bounds?.zoom || tl?.zoom || 10000)
+    const step     = Math.max(1, Math.floor(25 * 10000 / zoom))
+    const cols     = Math.max(1, Math.ceil(Math.abs(br.pan  - tl.pan)  / step) + 1)
+    const rows     = Math.max(1, Math.ceil(Math.abs(br.tilt - tl.tilt) / step) + 1)
+    return { cols, rows, total: cols * rows, zoom, step }
   })()
 
   return (
@@ -149,16 +156,22 @@ export default function SettingsModal({ onClose, onSave }) {
           {cfg.scan_mode === 'calibrated' && (
             <div style={{ background: C.bg, borderRadius: 8, padding: 16, border: `1px solid ${C.border}` }}>
               <p style={{ margin: '0 0 12px', fontSize: 12, color: C.muted }}>
-                Moves the camera through a grid of absolute positions from top-left to bottom-right using the bounds saved in Calibration.
+                Moves the camera left-to-right through a grid of absolute positions using the bounds saved in Calibration. Grid density is calculated from the saved zoom level.
               </p>
-              <div style={field}>
-                <label style={label}>Number of Scan Positions</label>
-                <input type="number" style={input} value={cfg.scan_positions} min={4} max={200}
-                  onChange={e => set('scan_positions', parseInt(e.target.value) || 12)} />
-              </div>
-              <p style={{ margin: '4px 0 0', fontSize: 11, color: C.muted }}>
-                Grid: approx {calGrid.cols} col{calGrid.cols !== 1 ? 's' : ''} × {calGrid.rows} row{calGrid.rows !== 1 ? 's' : ''} = {calGrid.cols * calGrid.rows} positions
-              </p>
+              {calGrid ? (
+                <div style={{ background: C.surface, borderRadius: 6, padding: '10px 14px', border: `1px solid ${C.border}` }}>
+                  <div style={{ fontSize: 13, color: C.text, marginBottom: 4 }}>
+                    Estimated frames: <strong>{calGrid.total}</strong>
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted }}>
+                    {calGrid.cols} col{calGrid.cols !== 1 ? 's' : ''} × {calGrid.rows} row{calGrid.rows !== 1 ? 's' : ''} &nbsp;·&nbsp; zoom {calGrid.zoom} &nbsp;·&nbsp; step {calGrid.step} units
+                  </div>
+                </div>
+              ) : (
+                <p style={{ margin: 0, fontSize: 11, color: C.muted, fontStyle: 'italic' }}>
+                  No calibration bounds saved — set bounds in the Calibration tab first.
+                </p>
+              )}
             </div>
           )}
         </div>
