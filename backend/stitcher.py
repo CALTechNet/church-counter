@@ -1,11 +1,13 @@
 """
 Panorama stitcher for sequential PTZ camera frames.
 
-Uses full perspective homographies (not just translations) to properly
-handle the curvature and perspective distortion from a ceiling-mounted
-PTZ camera.  Each consecutive frame pair is matched via ORB features
-with RANSAC homography estimation, then all frames are warped into a
-common coordinate system and blended with distance-weighted seams.
+Uses affine transforms (not full perspective homographies) to properly
+handle the curvature and distortion from a ceiling-mounted PTZ camera
+without accumulating perspective distortion across many frames.
+
+Each consecutive frame pair is matched via ORB features with RANSAC
+affine estimation, then all frames are warped into a common coordinate
+system and blended with distance-weighted seams.
 
 The middle frame is used as the reference to minimise accumulated
 distortion at the panorama edges.
@@ -40,7 +42,7 @@ def enhance_frame(frame: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Pairwise homography estimation
+# Pairwise affine estimation
 # ---------------------------------------------------------------------------
 
 _ORB_FEATURES  = 3000
@@ -49,13 +51,17 @@ _RANSAC_REPROJ = 5.0
 _MIN_INLIERS   = 10
 
 
-def _estimate_homography(
+def _estimate_affine(
     frame_a: np.ndarray,
     frame_b: np.ndarray,
 ) -> Optional[np.ndarray]:
     """
-    Estimate the 3×3 homography that maps *frame_b* into *frame_a*'s
-    coordinate system.  Returns None if matching fails.
+    Estimate the 2×3 affine transform that maps *frame_b* into *frame_a*'s
+    coordinate system.  Returns a 3×3 matrix (with [0,0,1] bottom row) or
+    None if matching fails.
+
+    Uses affine estimation instead of full homography to prevent accumulated
+    perspective distortion when chaining many transforms (the "bowtie" effect).
     """
     h_a, w_a = frame_a.shape[:2]
     h_b, w_b = frame_b.shape[:2]
@@ -90,34 +96,44 @@ def _estimate_homography(
     pts_a = np.float32([kp_a[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     pts_b = np.float32([kp_b[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-    H, inliers = cv2.findHomography(
-        pts_b, pts_a, cv2.RANSAC, _RANSAC_REPROJ,
+    # Estimate affine transform (translation + rotation + scale + shear)
+    # This is the key change: affine instead of full perspective homography
+    A, inliers = cv2.estimateAffine2D(
+        pts_b, pts_a, method=cv2.RANSAC, ransacReprojThreshold=_RANSAC_REPROJ,
     )
 
-    if H is None:
+    if A is None:
         return None
 
     n_inliers = int(inliers.sum()) if inliers is not None else 0
     if n_inliers < _MIN_INLIERS:
         return None
 
-    # Scale homography back to original resolution
-    S = np.array([[1 / scale, 0, 0], [0, 1 / scale, 0], [0, 0, 1]])
-    S_inv = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]])
-    H_full = S @ H @ S_inv
+    # Scale the affine transform back to original resolution
+    S = np.array([[1 / scale, 0, 0], [0, 1 / scale, 0]], dtype=np.float64)
+    S_inv = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]], dtype=np.float64)
+
+    # Convert 2×3 affine to 3×3 for matrix operations
+    A_3x3 = np.vstack([A, [0, 0, 1]])
+
+    # Scale: S_full @ A_3x3 @ S_inv
+    S_full = np.array(
+        [[1 / scale, 0, 0], [0, 1 / scale, 0], [0, 0, 1]], dtype=np.float64,
+    )
+    H_full = S_full @ A_3x3 @ S_inv
 
     logger.debug(
-        f"Homography: {n_inliers}/{len(good)} inliers, "
+        f"Affine: {n_inliers}/{len(good)} inliers, "
         f"dx≈{H_full[0, 2]:.1f}, dy≈{H_full[1, 2]:.1f}"
     )
     return H_full
 
 
-def _template_homography(
+def _template_affine(
     frame_a: np.ndarray,
     frame_b: np.ndarray,
 ) -> Optional[np.ndarray]:
-    """Fallback: pure-translation homography via template matching."""
+    """Fallback: pure-translation affine via template matching."""
     h_a, w_a = frame_a.shape[:2]
     h_b, w_b = frame_b.shape[:2]
 
@@ -155,22 +171,25 @@ def _template_homography(
     H[1, 2] = dy
 
     logger.debug(
-        f"Template homography: dx={dx:.1f} dy={dy:.1f} conf={max_val:.3f}"
+        f"Template affine: dx={dx:.1f} dy={dy:.1f} conf={max_val:.3f}"
     )
     return H
 
 
 # ---------------------------------------------------------------------------
-# Homography validation
+# Affine validation
 # ---------------------------------------------------------------------------
 
-def _is_valid_homography(H: np.ndarray, frame_shape: Tuple[int, ...]) -> bool:
-    """Reject homographies that produce extreme distortion."""
+def _is_valid_affine(H: np.ndarray, frame_shape: Tuple[int, ...]) -> bool:
+    """Reject affine transforms that produce extreme distortion."""
     h, w = frame_shape[:2]
     corners = np.float32(
         [[0, 0], [w, 0], [w, h], [0, h]]
     ).reshape(-1, 1, 2)
-    warped = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+
+    # Use the 2×3 part for affine transform of corners
+    A = H[:2, :]
+    warped = cv2.transform(corners, A).reshape(-1, 2)
 
     # Signed area via shoelace — must be positive (not flipped) and sane
     n = len(warped)
@@ -226,25 +245,26 @@ def _hist(frame: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Canvas compositing with perspective warping and blending
+# Canvas compositing with affine warping and blending
 # ---------------------------------------------------------------------------
 
-def _composite_homography(
+def _composite_affine(
     frames: List[np.ndarray],
-    homographies: List[np.ndarray],
+    transforms: List[np.ndarray],
 ) -> np.ndarray:
     """
-    Warp every frame using its accumulated homography and blend onto a
+    Warp every frame using its accumulated affine transform and blend onto a
     single canvas.  Uses distance-transform weights for seamless seams.
     """
     # Determine canvas bounds by transforming all frame corners
     all_corners = []
-    for frame, H in zip(frames, homographies):
+    for frame, H in zip(frames, transforms):
         h, w = frame.shape[:2]
         corners = np.float32(
             [[0, 0], [w, 0], [w, h], [0, h]]
         ).reshape(-1, 1, 2)
-        warped_corners = cv2.perspectiveTransform(corners, H)
+        A = H[:2, :]
+        warped_corners = cv2.transform(corners, A)
         all_corners.append(warped_corners.reshape(-1, 2))
 
     all_pts = np.vstack(all_corners)
@@ -260,8 +280,6 @@ def _composite_homography(
     canvas_h = int(np.ceil(max_y - min_y))
 
     # Cap canvas to prevent memory blow-up.
-    # With float32 buffers, peak memory ≈ 32 bytes/pixel × frame count overhead.
-    # 16000 max dim keeps worst-case (16000×16000) under ~10 GB.
     max_dim = 16000
     if max(canvas_w, canvas_h) > max_dim:
         s = max_dim / max(canvas_w, canvas_h)
@@ -275,22 +293,23 @@ def _composite_homography(
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
     weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
 
-    for i, (frame, H) in enumerate(zip(frames, homographies)):
+    for i, (frame, H) in enumerate(zip(frames, transforms)):
         H_final = T @ H
+        # Extract 2×3 for warpAffine
+        A_final = H_final[:2, :]
 
         # Warp the frame onto the canvas
-        warped = cv2.warpPerspective(
-            frame, H_final, (canvas_w, canvas_h),
+        warped = cv2.warpAffine(
+            frame, A_final, (canvas_w, canvas_h),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
 
         # Warp an all-white mask to know which pixels are valid
-        # (avoids confusing dark image content with black border)
         frame_mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
-        warped_mask = cv2.warpPerspective(
-            frame_mask, H_final, (canvas_w, canvas_h),
+        warped_mask = cv2.warpAffine(
+            frame_mask, A_final, (canvas_w, canvas_h),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
@@ -302,7 +321,6 @@ def _composite_homography(
         valid = cv2.erode(valid, kernel, iterations=2)
 
         # Distance transform gives smooth per-pixel blending weights
-        # (high in the centre of the valid area, tapering to zero at edges)
         dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5)
 
         canvas += warped.astype(np.float32) * dist[:, :, None]
@@ -330,9 +348,12 @@ def stitch_frames(
     """
     Stitch a sequence of overlapping frames into a single panorama.
 
-    Uses full perspective homographies to handle curvature and distortion
-    from a ceiling-mounted PTZ camera.  The middle frame is used as the
-    reference to minimise accumulated warp distortion.
+    Uses affine transforms (not full perspective homographies) to prevent
+    accumulated perspective distortion ("bowtie" warping) when chaining
+    many frames from a ceiling-mounted PTZ camera.
+
+    The middle frame is used as the reference to minimise accumulated
+    distortion at the panorama edges.
 
     grid_shape is accepted for API compatibility but ignored.
     Returns (panorama_image, status_string).
@@ -355,30 +376,30 @@ def stitch_frames(
     logger.info("Enhancing frames for feature detection…")
     enhanced = [enhance_frame(f) for f in unique]
 
-    # 3 — compute pairwise homographies between consecutive frames
-    logger.info("Computing pairwise homographies…")
+    # 3 — compute pairwise affine transforms between consecutive frames
+    logger.info("Computing pairwise affine transforms…")
     pairwise: List[np.ndarray] = []
     failed_pairs = 0
 
     for i in range(n - 1):
-        H = _estimate_homography(enhanced[i], enhanced[i + 1])
+        H = _estimate_affine(enhanced[i], enhanced[i + 1])
 
-        if H is not None and not _is_valid_homography(H, unique[i + 1].shape):
+        if H is not None and not _is_valid_affine(H, unique[i + 1].shape):
             logger.warning(
-                f"  Pair {i}→{i+1}: homography rejected (extreme distortion)"
+                f"  Pair {i}→{i+1}: affine rejected (extreme distortion)"
             )
             H = None
 
         if H is None:
-            H = _template_homography(enhanced[i], enhanced[i + 1])
+            H = _template_affine(enhanced[i], enhanced[i + 1])
 
         if H is None:
-            H = _estimate_homography(unique[i], unique[i + 1])
-            if H is not None and not _is_valid_homography(H, unique[i + 1].shape):
+            H = _estimate_affine(unique[i], unique[i + 1])
+            if H is not None and not _is_valid_affine(H, unique[i + 1].shape):
                 H = None
 
         if H is None:
-            H = _template_homography(unique[i], unique[i + 1])
+            H = _template_affine(unique[i], unique[i + 1])
 
         if H is None:
             # Pure translation guess as last resort
@@ -394,7 +415,7 @@ def stitch_frames(
         pairwise.append(H)
 
         if (i + 1) % 10 == 0 or i == n - 2:
-            logger.info(f"  Homography {i+1}/{n-1} done")
+            logger.info(f"  Affine {i+1}/{n-1} done")
 
         gc.collect()
 
@@ -404,7 +425,7 @@ def stitch_frames(
     if failed_pairs > 0:
         logger.warning(f"{failed_pairs}/{n-1} pairs used fallback placement")
 
-    # 4 — chain pairwise homographies into absolute transforms
+    # 4 — chain pairwise transforms into absolute transforms
     #     pairwise[i] maps frame (i+1) → frame i's coordinate space
     #     So H_abs[k] = pairwise[0] @ pairwise[1] @ … @ pairwise[k-1]
     #     maps frame k into frame 0's space.
@@ -417,9 +438,9 @@ def stitch_frames(
     H_ref_inv = np.linalg.inv(H_abs[ref])
     H_abs = [H_ref_inv @ H for H in H_abs]
 
-    # 5 — composite originals with perspective warping
-    logger.info("Compositing panorama with perspective warping…")
-    panorama = _composite_homography(unique, H_abs)
+    # 5 — composite originals with affine warping
+    logger.info("Compositing panorama with affine warping…")
+    panorama = _composite_affine(unique, H_abs)
 
     # 6 — crop black borders
     panorama = _crop_black(panorama)
