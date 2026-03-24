@@ -1,9 +1,11 @@
+import os
 import sqlite3
 import json
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path("/data/church.db")
+_DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/church-counter/data"))
+DB_PATH = Path(os.environ.get("DB_PATH", str(_DATA_DIR / "church.db")))
 
 
 def init_db():

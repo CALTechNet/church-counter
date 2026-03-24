@@ -1,5 +1,5 @@
 """
-YOLO26x person detection with tiled inference for Lakeshore Church attendance scanner.
+YOLO26x person detection with tiled inference for the Church Attendance Counter.
 Tiling splits the panorama into overlapping sections so people in back rows
 (who appear small in the full image) are detected at a larger effective size.
 
@@ -12,7 +12,7 @@ YOLO26x improvements over YOLO11x:
 Performance notes (ENCS5412 / Xeon D / CPU-only):
   - All tiles are batched into a single YOLO call to minimise Python/PyTorch overhead
   - For further speedup, export to OpenVINO with export_openvino.sh (2-4x on Intel CPUs)
-    then set YOLO_MODEL=/models/yolo26x_openvino_model in docker-compose.yml
+    then set YOLO_MODEL=/opt/church-counter/models/yolo_openvino_model in docker-compose.yml
   - Cross-tile NMS deduplication is still applied after merging all tile results
 """
 import logging

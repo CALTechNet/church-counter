@@ -8,12 +8,12 @@
 #
 #  Then activate it by adding this line to the `environment:` section of
 #  docker-compose.yml and running `docker compose up -d` (no rebuild needed):
-#    - YOLO_MODEL=/models/yolo26x_openvino_model
+#    - YOLO_MODEL=/opt/church-counter/models/yolo_openvino_model
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
 
-MODELS_DIR="/etc/church-counter/models"
+MODELS_DIR="${MODELS_DIR:-/opt/church-counter/models}"
 mkdir -p "$MODELS_DIR"
 
 echo ""
@@ -24,7 +24,7 @@ echo ""
 echo "This will:"
 echo "  1. Load the YOLO26x model inside the container"
 echo "  2. Export it to OpenVINO INT8 format (~5-10 min)"
-echo "  3. Save to: $MODELS_DIR/yolo26x_openvino_model/"
+echo "  3. Save to: $MODELS_DIR/yolo_openvino_model/"
 echo ""
 echo "Expected speedup on Xeon D: 2-4x faster per scan"
 echo ""
@@ -43,8 +43,9 @@ sys.path.insert(0, '/app/backend')
 
 from ultralytics import YOLO
 
-model_name = os.getenv("YOLO_MODEL", "yolo26x.pt")
-output_dir = "/models/yolo26x_openvino_model"
+models_dir = os.getenv("MODELS_DIR", "/opt/church-counter/models")
+model_name = os.getenv("YOLO_MODEL", "yolo11x.pt")
+output_dir = os.path.join(models_dir, "yolo_openvino_model")
 
 # Don't re-export if already done
 if os.path.isdir(output_dir):
@@ -77,7 +78,7 @@ print("")
 print("=============================================")
 print("  Done! To activate OpenVINO inference:")
 print("  Add this to docker-compose.yml environment:")
-print("    - YOLO_MODEL=/models/yolo26x_openvino_model")
+print("    - YOLO_MODEL=/opt/church-counter/models/yolo_openvino_model")
 print("  Then run: docker compose up -d")
 print("  (no rebuild needed)")
 print("=============================================")
@@ -87,7 +88,7 @@ echo ""
 echo "Export finished."
 echo ""
 echo "Next step — add this to docker-compose.yml under 'environment:':"
-echo "  - YOLO_MODEL=/models/yolo26x_openvino_model"
+echo "  - YOLO_MODEL=/opt/church-counter/models/yolo_openvino_model"
 echo ""
 echo "Then apply with:  docker compose up -d"
 echo "(no rebuild needed — just an env var change)"

@@ -29,8 +29,15 @@ COPY backend/ ./backend/
 # Built frontend from stage 1
 COPY --from=frontend /app/build /frontend/build
 
-# Runtime directories
-RUN mkdir -p /data /config
+# Runtime directories — actual data lives in Docker volumes mounted here
+RUN mkdir -p /opt/church-counter/data \
+             /opt/church-counter/config \
+             /opt/church-counter/models
+
+# Default env paths (override via docker-compose environment or -e flags)
+ENV DATA_DIR=/opt/church-counter/data \
+    CONFIG_DIR=/opt/church-counter/config \
+    MODELS_DIR=/opt/church-counter/models
 
 EXPOSE 8000
 
