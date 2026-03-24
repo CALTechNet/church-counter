@@ -190,8 +190,12 @@ def _stitch_long_column(frames: List[np.ndarray]) -> np.ndarray:
 
 def _stitch_strips(strips: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     """
-    Stitch column strips horizontally.  Tries all-at-once first, then
-    falls back to progressive pair-wise stitching (left-to-right).
+    Stitch column strips horizontally using tree reduction.
+
+    Instead of accumulating left-to-right (which makes one side huge and
+    causes OpenCV feature-matching to fail once the aspect ratios diverge),
+    we stitch adjacent pairs, then pairs of pairs, etc.  This keeps image
+    sizes balanced at every level of the tree.
     """
     if len(strips) == 1:
         return strips[0], "ok_grid"
@@ -201,21 +205,36 @@ def _stitch_strips(strips: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]
         final, status = _stitch_batch(strips)
         if final is not None:
             return final, "ok_grid"
-        logger.warning("All-at-once strip stitch failed — trying progressive")
+        logger.warning("All-at-once strip stitch failed — trying tree reduction")
 
-    # Progressive: stitch strips pair-wise left-to-right
-    result = strips[0]
-    for i, strip in enumerate(strips[1:], 1):
-        logger.info(f"Progressive strip stitch {i}/{len(strips) - 1}…")
-        merged, _ = _stitch_batch([result, strip])
-        if merged is not None:
-            result = merged
-        else:
-            logger.warning(f"Progressive stitch failed at strip {i + 1} — horizontal concat")
-            result = _concat_fallback([result, strip])
-        gc.collect()
+    # Tree reduction: stitch adjacent pairs, then pairs of pairs, …
+    level = strips
+    tree_level = 0
+    while len(level) > 1:
+        tree_level += 1
+        next_level: List[np.ndarray] = []
+        for j in range(0, len(level), 2):
+            if j + 1 >= len(level):
+                # Odd one out — carry forward
+                next_level.append(level[j])
+                continue
+            logger.info(
+                f"Tree stitch level {tree_level}, pair {j // 2 + 1}/"
+                f"{math.ceil(len(level) / 2)}…"
+            )
+            merged, _ = _stitch_batch([level[j], level[j + 1]])
+            if merged is not None:
+                next_level.append(merged)
+            else:
+                logger.warning(
+                    f"Tree stitch failed at level {tree_level} pair {j // 2 + 1} "
+                    f"— horizontal concat"
+                )
+                next_level.append(_concat_fallback([level[j], level[j + 1]]))
+            gc.collect()
+        level = next_level
 
-    return result, "ok_grid_progressive"
+    return level[0], "ok_grid_tree"
 
 
 def _vconcat_fallback(frames: List[np.ndarray]) -> np.ndarray:
