@@ -6,8 +6,13 @@ Fallback: Horizontal concat (resized to common height)
 Low-light fix: frames are contrast-enhanced before feature detection
 so the stitcher finds enough keypoints at 52% house lights.
 The saved/displayed image uses the original brightness.
+
+Crash prevention: only ever stitch 2 frames at a time, then
+accumulate by stitching the running result with the next frame.
+This keeps OpenCV memory usage minimal and avoids native segfaults.
 """
 import base64
+import gc
 import logging
 from typing import List, Optional, Tuple
 
@@ -32,13 +37,77 @@ def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
     return cv2.LUT(enhanced, lut)
 
 
+def _stitch_pair(a: np.ndarray, b: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Stitch exactly 2 frames. Tries enhanced first, then original.
+    Returns None on failure.
+    """
+    try:
+        enhanced = [_enhance_for_stitching(a), _enhance_for_stitching(b)]
+        stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+        status, pano = stitcher.stitch(enhanced)
+        del enhanced, stitcher
+        gc.collect()
+
+        if status == cv2.Stitcher_OK:
+            return pano
+
+        logger.debug(f"Enhanced pair stitch failed (status={status}), trying originals")
+        stitcher2 = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+        status2, pano2 = stitcher2.stitch([a, b])
+        del stitcher2
+        gc.collect()
+
+        if status2 == cv2.Stitcher_OK:
+            return pano2
+
+    except Exception as exc:
+        logger.warning(f"Stitch pair exception: {exc}")
+        gc.collect()
+
+    return None
+
+
+def _hconcat_pair(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Resize two frames to the same height, then horizontally concatenate."""
+    target_h = min(a.shape[0], b.shape[0])
+    ha, wa = a.shape[:2]
+    hb, wb = b.shape[:2]
+    ra = cv2.resize(a, (int(wa * target_h / ha), target_h))
+    rb = cv2.resize(b, (int(wb * target_h / hb), target_h))
+    return np.hstack([ra, rb])
+
+
+def _stitch_sequential(frames: List[np.ndarray], label: str = "") -> np.ndarray:
+    """
+    Stitch a list of frames by accumulating one at a time:
+      result = frames[0]
+      result = stitch(result, frames[1])
+      result = stitch(result, frames[2])
+      ...
+    Falls back to hconcat for any pair that fails.
+    """
+    result = frames[0]
+    for i, frame in enumerate(frames[1:], 1):
+        logger.info(f"  {label}Stitching frame {i + 1}/{len(frames)}")
+        merged = _stitch_pair(result, frame)
+        if merged is not None:
+            result = merged
+        else:
+            logger.warning(f"  {label}Pair stitch failed at frame {i + 1}, using hconcat")
+            result = _hconcat_pair(result, frame)
+        gc.collect()
+    return result
+
+
 def stitch_frames(
     frames: List[np.ndarray],
     grid_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Optional[np.ndarray], str]:
     """
-    Stitch frames into a panorama.
-    Enhances frames for feature detection but outputs original-brightness panorama.
+    Stitch frames into a panorama — only ever 2 frames per OpenCV call.
+    Walks through every frame in order, stitching each onto the accumulator.
+    grid_shape is accepted but ignored (kept for API compat).
     Returns (image, status_message).
     """
     if not frames:
@@ -49,37 +118,13 @@ def stitch_frames(
 
     # Deduplicate near-identical frames
     unique = _deduplicate(frames)
-    logger.info(f"Stitching {len(unique)} unique frames (from {len(frames)} captured)")
+    n = len(unique)
+    logger.info(f"Stitching {n} unique frames (from {len(frames)} captured)")
 
-    # Try stitching with enhanced frames first (better keypoint detection in low light)
-    enhanced = [_enhance_for_stitching(f) for f in unique]
-    stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
-    status, pano = stitcher.stitch(enhanced)
-
-    if status == cv2.Stitcher_OK:
-        pano = _crop_black(pano)
-        logger.info(f"Stitch OK (enhanced) — output shape: {pano.shape}")
-        return pano, "ok"
-
-    logger.warning(f"Enhanced stitch failed (status={status}), trying original frames…")
-
-    # Retry with original frames
-    status2, pano2 = stitcher.stitch(unique)
-    if status2 == cv2.Stitcher_OK:
-        pano2 = _crop_black(pano2)
-        logger.info(f"Stitch OK (original) — output shape: {pano2.shape}")
-        return pano2, "ok_original"
-
-    logger.warning(f"Both stitch attempts failed, using fallback concat")
-
-    # Fallback: resize all to same height, concat
-    target_h = min(f.shape[0] for f in unique)
-    resized = []
-    for f in unique:
-        h, w = f.shape[:2]
-        new_w = int(w * target_h / h)
-        resized.append(cv2.resize(f, (new_w, target_h)))
-    return np.hstack(resized), "fallback_concat"
+    result = _stitch_sequential(unique)
+    result = _crop_black(result)
+    logger.info(f"Stitch complete — output shape: {result.shape}")
+    return result, "ok"
 
 
 def _deduplicate(frames: List[np.ndarray], threshold: float = 0.97) -> List[np.ndarray]:
