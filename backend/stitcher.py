@@ -9,6 +9,7 @@ The saved/displayed image uses the original brightness.
 """
 import base64
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
 import cv2
@@ -49,7 +50,8 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     logger.info(f"Stitching {len(unique)} unique frames (from {len(frames)} captured)")
 
     # Try stitching with enhanced frames first (better keypoint detection in low light)
-    enhanced = [_enhance_for_stitching(f) for f in unique]
+    with ThreadPoolExecutor() as pool:
+        enhanced = list(pool.map(_enhance_for_stitching, unique))
     stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
     status, pano = stitcher.stitch(enhanced)
 
