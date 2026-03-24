@@ -1,22 +1,14 @@
 """
-Incremental panorama stitcher for sequential PTZ camera frames.
+Panorama stitcher for sequential PTZ camera frames.
 
-Each consecutive frame overlaps its neighbour.  Rather than using OpenCV's
-high-level Stitcher (which estimates full homographies and breaks when the
-accumulator outgrows a single frame), we:
+Uses full perspective homographies (not just translations) to properly
+handle the curvature and perspective distortion from a ceiling-mounted
+PTZ camera.  Each consecutive frame pair is matched via ORB features
+with RANSAC homography estimation, then all frames are warped into a
+common coordinate system and blended with distance-weighted seams.
 
-  1. Enhance every raw frame (CLAHE + gamma) for better feature detection.
-  2. Detect ORB features and match consecutive pairs to find the
-     translation offset between them.
-  3. Accumulate absolute (x, y) positions for every frame.
-  4. Composite all frames onto one canvas with linear-blend seams.
-
-The result is a single large image built from the *original* (un-enhanced)
-frames so no data is lost.  The final output is returned as a numpy array
-and can be compressed to JPEG at the caller's discretion.
-
-For very large runs (>100 frames) the pipeline works identically — offsets
-are O(n) pairwise computations and the final composite is a single pass.
+The middle frame is used as the reference to minimise accumulated
+distortion at the panorama edges.
 """
 
 import base64
@@ -30,14 +22,11 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Enhancement (applied to raw frames *before* feature detection)
+# Enhancement (applied to copies for feature detection only)
 # ---------------------------------------------------------------------------
 
 def enhance_frame(frame: np.ndarray) -> np.ndarray:
-    """
-    Boost contrast + brightness so ORB finds keypoints in dark sanctuary
-    frames.  CLAHE on the L channel of LAB + a gamma 2.0 lift.
-    """
+    """Boost contrast + brightness so ORB finds keypoints in dark frames."""
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
@@ -51,27 +40,23 @@ def enhance_frame(frame: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Pairwise offset estimation
+# Pairwise homography estimation
 # ---------------------------------------------------------------------------
 
-_ORB_FEATURES = 3000          # keypoints per frame
-_MATCH_RATIO  = 0.75          # Lowe's ratio test threshold
-_RANSAC_REPROJ = 5.0          # RANSAC reprojection threshold (px)
-_MIN_INLIERS  = 8             # minimum matches to trust an offset
+_ORB_FEATURES  = 3000
+_MATCH_RATIO   = 0.75
+_RANSAC_REPROJ = 5.0
+_MIN_INLIERS   = 10
 
 
-def _estimate_offset(
+def _estimate_homography(
     frame_a: np.ndarray,
     frame_b: np.ndarray,
-) -> Optional[Tuple[float, float]]:
+) -> Optional[np.ndarray]:
     """
-    Estimate the (dx, dy) translation that maps *frame_b* onto the
-    coordinate system of *frame_a*.  Returns None if matching fails.
-
-    Positive dx → frame_b is to the right of frame_a.
-    Positive dy → frame_b is below frame_a.
+    Estimate the 3×3 homography that maps *frame_b* into *frame_a*'s
+    coordinate system.  Returns None if matching fails.
     """
-    # Work on grayscale, down-scaled for speed
     h_a, w_a = frame_a.shape[:2]
     h_b, w_b = frame_b.shape[:2]
     scale = min(1.0, 800.0 / max(h_a, w_a, h_b, w_b))
@@ -89,7 +74,6 @@ def _estimate_offset(
     if des_a is None or des_b is None or len(kp_a) < 4 or len(kp_b) < 4:
         return None
 
-    # Brute-force Hamming match + Lowe's ratio test
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
     raw_matches = bf.knnMatch(des_a, des_b, k=2)
 
@@ -106,44 +90,37 @@ def _estimate_offset(
     pts_a = np.float32([kp_a[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     pts_b = np.float32([kp_b[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-    # Estimate affine (translation + rotation + scale) via RANSAC
-    # We only really expect translation, but allowing affine handles minor
-    # camera rotation between presets.
-    M, inliers = cv2.estimateAffinePartial2D(
-        pts_b, pts_a, method=cv2.RANSAC, ransacReprojThreshold=_RANSAC_REPROJ
+    H, inliers = cv2.findHomography(
+        pts_b, pts_a, cv2.RANSAC, _RANSAC_REPROJ,
     )
 
-    if M is None:
+    if H is None:
         return None
 
     n_inliers = int(inliers.sum()) if inliers is not None else 0
     if n_inliers < _MIN_INLIERS:
         return None
 
-    # Translation component of the 2×3 affine matrix, scaled back up
-    dx = M[0, 2] / scale
-    dy = M[1, 2] / scale
+    # Scale homography back to original resolution
+    S = np.array([[1 / scale, 0, 0], [0, 1 / scale, 0], [0, 0, 1]])
+    S_inv = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]])
+    H_full = S @ H @ S_inv
 
     logger.debug(
-        f"Offset: dx={dx:.1f}  dy={dy:.1f}  "
-        f"({n_inliers}/{len(good)} inliers, scale={M[0,0]:.3f})"
+        f"Homography: {n_inliers}/{len(good)} inliers, "
+        f"dx≈{H_full[0, 2]:.1f}, dy≈{H_full[1, 2]:.1f}"
     )
-    return (dx, dy)
+    return H_full
 
 
-def _template_offset(
+def _template_homography(
     frame_a: np.ndarray,
     frame_b: np.ndarray,
-) -> Optional[Tuple[float, float]]:
-    """
-    Fallback offset estimation using template matching when ORB fails.
-    Uses a center crop of frame_b as a template searched within frame_a's
-    extended region.
-    """
+) -> Optional[np.ndarray]:
+    """Fallback: pure-translation homography via template matching."""
     h_a, w_a = frame_a.shape[:2]
     h_b, w_b = frame_b.shape[:2]
 
-    # Downscale for speed
     scale = min(1.0, 600.0 / max(h_a, w_a, h_b, w_b))
     if scale < 1.0:
         a = cv2.resize(frame_a, None, fx=scale, fy=scale)
@@ -153,10 +130,8 @@ def _template_offset(
 
     gray_a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
     gray_b = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
-    sh_a, sw_a = gray_a.shape
     sh_b, sw_b = gray_b.shape
 
-    # Use a generous center crop of B as the template (40% of each dimension)
     crop_h = max(32, int(sh_b * 0.4))
     crop_w = max(32, int(sw_b * 0.4))
     y0 = (sh_b - crop_h) // 2
@@ -172,21 +147,65 @@ def _template_offset(
     if max_val < 0.25:
         return None
 
-    # max_loc is where the template's top-left was found in A.
-    # The template was taken from (x0, y0) in B.
-    # So B's origin in A's coordinate space is at (max_loc[0] - x0, max_loc[1] - y0).
     dx = (max_loc[0] - x0) / scale
     dy = (max_loc[1] - y0) / scale
 
-    logger.debug(f"Template offset: dx={dx:.1f}  dy={dy:.1f}  confidence={max_val:.3f}")
-    return (dx, dy)
+    H = np.eye(3, dtype=np.float64)
+    H[0, 2] = dx
+    H[1, 2] = dy
+
+    logger.debug(
+        f"Template homography: dx={dx:.1f} dy={dy:.1f} conf={max_val:.3f}"
+    )
+    return H
+
+
+# ---------------------------------------------------------------------------
+# Homography validation
+# ---------------------------------------------------------------------------
+
+def _is_valid_homography(H: np.ndarray, frame_shape: Tuple[int, ...]) -> bool:
+    """Reject homographies that produce extreme distortion."""
+    h, w = frame_shape[:2]
+    corners = np.float32(
+        [[0, 0], [w, 0], [w, h], [0, h]]
+    ).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+
+    # Signed area via shoelace — must be positive (not flipped) and sane
+    n = len(warped)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += warped[i][0] * warped[j][1]
+        area -= warped[j][0] * warped[i][1]
+    area /= 2.0
+
+    original_area = float(h * w)
+    ratio = abs(area) / original_area
+
+    if area < 0 or ratio < 0.5 or ratio > 2.0:
+        return False
+
+    # No edge should stretch beyond 2× or shrink below 0.3×
+    orig_corners = corners.reshape(-1, 2)
+    for i in range(4):
+        j = (i + 1) % 4
+        edge = float(np.linalg.norm(warped[i] - warped[j]))
+        orig = float(np.linalg.norm(orig_corners[i] - orig_corners[j]))
+        if orig > 0 and (edge / orig > 2.0 or edge / orig < 0.3):
+            return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Deduplication
 # ---------------------------------------------------------------------------
 
-def _deduplicate(frames: List[np.ndarray], threshold: float = 0.97) -> List[np.ndarray]:
+def _deduplicate(
+    frames: List[np.ndarray], threshold: float = 0.97,
+) -> List[np.ndarray]:
     """Remove near-duplicate consecutive frames based on histogram correlation."""
     if len(frames) <= 2:
         return frames
@@ -207,63 +226,88 @@ def _hist(frame: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Canvas compositing with linear blending
+# Canvas compositing with perspective warping and blending
 # ---------------------------------------------------------------------------
 
-def _composite(
+def _composite_homography(
     frames: List[np.ndarray],
-    positions: List[Tuple[float, float]],
+    homographies: List[np.ndarray],
 ) -> np.ndarray:
     """
-    Place every frame at its absolute (x, y) position on a single canvas.
-    Where frames overlap, use distance-based alpha blending so seams are
-    invisible.
+    Warp every frame using its accumulated homography and blend onto a
+    single canvas.  Uses distance-transform weights for seamless seams.
     """
-    # Compute canvas bounds
-    xs, ys = [], []
-    for (x, y), frame in zip(positions, frames):
+    # Determine canvas bounds by transforming all frame corners
+    all_corners = []
+    for frame, H in zip(frames, homographies):
         h, w = frame.shape[:2]
-        xs.extend([x, x + w])
-        ys.extend([y, y + h])
+        corners = np.float32(
+            [[0, 0], [w, 0], [w, h], [0, h]]
+        ).reshape(-1, 1, 2)
+        warped_corners = cv2.perspectiveTransform(corners, H)
+        all_corners.append(warped_corners.reshape(-1, 2))
 
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
+    all_pts = np.vstack(all_corners)
+    min_x, min_y = all_pts.min(axis=0)
+    max_x, max_y = all_pts.max(axis=0)
+
+    # Translation so everything has positive coordinates
+    T = np.array(
+        [[1, 0, -min_x], [0, 1, -min_y], [0, 0, 1]], dtype=np.float64,
+    )
+
     canvas_w = int(np.ceil(max_x - min_x))
     canvas_h = int(np.ceil(max_y - min_y))
 
+    # Cap canvas to prevent memory blow-up
+    max_dim = 16000
+    if max(canvas_w, canvas_h) > max_dim:
+        s = max_dim / max(canvas_w, canvas_h)
+        S = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float64)
+        T = S @ T
+        canvas_w = int(canvas_w * s)
+        canvas_h = int(canvas_h * s)
+
     logger.info(f"Canvas size: {canvas_w} × {canvas_h}")
 
-    # Accumulate weighted colour and weight for linear blending
-    # Use float32 for accumulation
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float64)
     weight = np.zeros((canvas_h, canvas_w), dtype=np.float64)
 
-    for (x, y), frame in zip(positions, frames):
-        h, w = frame.shape[:2]
-        ox = int(round(x - min_x))
-        oy = int(round(y - min_y))
+    for i, (frame, H) in enumerate(zip(frames, homographies)):
+        H_final = T @ H
 
-        # Clamp to canvas (shouldn't be needed, but safety)
-        pw = min(w, canvas_w - ox)
-        ph = min(h, canvas_h - oy)
-        if pw <= 0 or ph <= 0:
-            continue
+        # Warp the frame onto the canvas
+        warped = cv2.warpPerspective(
+            frame, H_final, (canvas_w, canvas_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
 
-        # Per-pixel weight: ramp from edges so overlapping regions blend smoothly
-        # Weight = min(distance from each edge) — higher in the centre
-        ramp_x = np.minimum(
-            np.arange(pw, dtype=np.float64),
-            np.arange(pw, 0, -1, dtype=np.float64),
-        ) + 1.0
-        ramp_y = np.minimum(
-            np.arange(ph, dtype=np.float64),
-            np.arange(ph, 0, -1, dtype=np.float64),
-        ) + 1.0
-        w_map = ramp_y[:, None] * ramp_x[None, :]  # (ph, pw)
+        # Warp an all-white mask to know which pixels are valid
+        # (avoids confusing dark image content with black border)
+        frame_mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+        warped_mask = cv2.warpPerspective(
+            frame_mask, H_final, (canvas_w, canvas_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        valid = (warped_mask > 128).astype(np.uint8)
 
-        roi = frame[:ph, :pw].astype(np.float64)
-        canvas[oy:oy + ph, ox:ox + pw] += roi * w_map[:, :, None]
-        weight[oy:oy + ph, ox:ox + pw] += w_map
+        # Erode mask slightly to clip interpolation artefacts at edges
+        kernel = np.ones((3, 3), np.uint8)
+        valid = cv2.erode(valid, kernel, iterations=2)
+
+        # Distance transform gives smooth per-pixel blending weights
+        # (high in the centre of the valid area, tapering to zero at edges)
+        dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5).astype(np.float64)
+
+        canvas += warped.astype(np.float64) * dist[:, :, None]
+        weight += dist
+
+        if (i + 1) % 10 == 0 or i == len(frames) - 1:
+            logger.info(f"  Warped {i + 1}/{len(frames)} frames")
 
     # Normalise
     mask = weight > 0
@@ -284,18 +328,11 @@ def stitch_frames(
     """
     Stitch a sequence of overlapping frames into a single panorama.
 
-    Algorithm:
-      1. Deduplicate near-identical consecutive frames.
-      2. Enhance each frame (CLAHE + gamma) for feature detection.
-      3. Compute pairwise translation offsets between consecutive enhanced
-         frames using ORB feature matching (with template-match fallback).
-      4. Accumulate absolute positions.
-      5. Composite *original* (un-enhanced) frames onto one canvas with
-         distance-weighted blending.
+    Uses full perspective homographies to handle curvature and distortion
+    from a ceiling-mounted PTZ camera.  The middle frame is used as the
+    reference to minimise accumulated warp distortion.
 
-    grid_shape is accepted for API compatibility but ignored — sequential
-    registration handles any scan pattern.
-
+    grid_shape is accepted for API compatibility but ignored.
     Returns (panorama_image, status_string).
     """
     if not frames:
@@ -304,7 +341,7 @@ def stitch_frames(
     if len(frames) == 1:
         return frames[0], "single_frame"
 
-    # Step 1: deduplicate
+    # 1 — deduplicate
     unique = _deduplicate(frames)
     n = len(unique)
     logger.info(f"Stitching {n} unique frames (from {len(frames)} captured)")
@@ -312,61 +349,77 @@ def stitch_frames(
     if n == 1:
         return unique[0], "single_frame"
 
-    # Step 2: enhance for feature detection
+    # 2 — enhance copies for feature detection
     logger.info("Enhancing frames for feature detection…")
     enhanced = [enhance_frame(f) for f in unique]
 
-    # Step 3: compute pairwise offsets
-    logger.info("Computing pairwise offsets…")
-    positions: List[Tuple[float, float]] = [(0.0, 0.0)]
+    # 3 — compute pairwise homographies between consecutive frames
+    logger.info("Computing pairwise homographies…")
+    pairwise: List[np.ndarray] = []
     failed_pairs = 0
 
-    for i in range(len(enhanced) - 1):
-        offset = _estimate_offset(enhanced[i], enhanced[i + 1])
+    for i in range(n - 1):
+        H = _estimate_homography(enhanced[i], enhanced[i + 1])
 
-        if offset is None:
-            # Fallback: template matching on enhanced frames
-            offset = _template_offset(enhanced[i], enhanced[i + 1])
+        if H is not None and not _is_valid_homography(H, unique[i + 1].shape):
+            logger.warning(
+                f"  Pair {i}→{i+1}: homography rejected (extreme distortion)"
+            )
+            H = None
 
-        if offset is None:
-            # Last resort: try on originals
-            offset = _estimate_offset(unique[i], unique[i + 1])
+        if H is None:
+            H = _template_homography(enhanced[i], enhanced[i + 1])
 
-        if offset is None:
-            offset = _template_offset(unique[i], unique[i + 1])
+        if H is None:
+            H = _estimate_homography(unique[i], unique[i + 1])
+            if H is not None and not _is_valid_homography(H, unique[i + 1].shape):
+                H = None
 
-        if offset is None:
-            # Cannot determine offset — place to the right with slight overlap
-            h, w = unique[i + 1].shape[:2]
+        if H is None:
+            H = _template_homography(unique[i], unique[i + 1])
+
+        if H is None:
+            # Pure translation guess as last resort
             prev_w = unique[i].shape[1]
             overlap_guess = int(prev_w * 0.15)
-            offset = (prev_w - overlap_guess, 0)
+            H = np.eye(3, dtype=np.float64)
+            H[0, 2] = prev_w - overlap_guess
             failed_pairs += 1
             logger.warning(
-                f"  Pair {i}→{i+1}: all matching failed, guessing horizontal placement"
+                f"  Pair {i}→{i+1}: all matching failed, guessing placement"
             )
 
-        dx, dy = offset
-        prev_x, prev_y = positions[-1]
-        positions.append((prev_x + dx, prev_y + dy))
+        pairwise.append(H)
 
-        if (i + 1) % 10 == 0 or i == len(enhanced) - 2:
-            logger.info(f"  Offset {i+1}/{len(enhanced)-1} done")
+        if (i + 1) % 10 == 0 or i == n - 2:
+            logger.info(f"  Homography {i+1}/{n-1} done")
 
         gc.collect()
 
-    # Free enhanced frames — we only need originals for compositing
     del enhanced
     gc.collect()
 
     if failed_pairs > 0:
         logger.warning(f"{failed_pairs}/{n-1} pairs used fallback placement")
 
-    # Step 4: composite originals onto canvas
-    logger.info("Compositing panorama…")
-    panorama = _composite(unique, positions)
+    # 4 — chain pairwise homographies into absolute transforms
+    #     pairwise[i] maps frame (i+1) → frame i's coordinate space
+    #     So H_abs[k] = pairwise[0] @ pairwise[1] @ … @ pairwise[k-1]
+    #     maps frame k into frame 0's space.
+    H_abs: List[np.ndarray] = [np.eye(3, dtype=np.float64)]
+    for i in range(n - 1):
+        H_abs.append(H_abs[-1] @ pairwise[i])
 
-    # Step 5: crop any black border
+    # Re-reference to the middle frame to minimise distortion
+    ref = n // 2
+    H_ref_inv = np.linalg.inv(H_abs[ref])
+    H_abs = [H_ref_inv @ H for H in H_abs]
+
+    # 5 — composite originals with perspective warping
+    logger.info("Compositing panorama with perspective warping…")
+    panorama = _composite_homography(unique, H_abs)
+
+    # 6 — crop black borders
     panorama = _crop_black(panorama)
 
     logger.info(f"Stitch complete — output shape: {panorama.shape}")
@@ -379,10 +432,12 @@ def stitch_frames(
 # ---------------------------------------------------------------------------
 
 def _crop_black(img: np.ndarray) -> np.ndarray:
-    """Crop black borders that may appear from canvas compositing."""
+    """Crop black borders from panorama."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
     if not contours:
         return img
     x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
