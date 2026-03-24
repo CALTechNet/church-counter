@@ -163,8 +163,11 @@ export default function SettingsModal({ onClose, onSave }) {
                   <div style={{ fontSize: 13, color: C.text, marginBottom: 4 }}>
                     Estimated frames: <strong>{calGrid.total}</strong>
                   </div>
-                  <div style={{ fontSize: 11, color: C.muted }}>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>
                     {calGrid.cols} col{calGrid.cols !== 1 ? 's' : ''} × {calGrid.rows} row{calGrid.rows !== 1 ? 's' : ''} &nbsp;·&nbsp; zoom {calGrid.zoom} &nbsp;·&nbsp; step {calGrid.step} units
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted }}>
+                    ~{Math.max(1, Math.round((calGrid.total * 1.5 + 3) / 60))} min{Math.max(1, Math.round((calGrid.total * 1.5 + 3) / 60)) !== 1 ? 's' : ''}
                   </div>
                 </div>
               ) : (
