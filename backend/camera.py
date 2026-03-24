@@ -472,6 +472,17 @@ async def _calibrated_scan(
     cols = max(1, math.ceil(pan_range  / pan_step)  + 1)
     rows = max(1, math.ceil(tilt_range / tilt_step) + 1)
 
+    # Cap total positions at 100 frames; scale grid down while preserving aspect ratio
+    MAX_FRAMES = 100
+    if cols * rows > MAX_FRAMES:
+        aspect = pan_range / max(tilt_range, 1)
+        rows = max(1, int(math.sqrt(MAX_FRAMES / max(aspect, 1e-9))))
+        cols = max(1, MAX_FRAMES // rows)
+        logger.info(
+            f"Grid exceeds {MAX_FRAMES} frames — adjusted to {cols} cols × {rows} rows "
+            f"({cols * rows} positions)"
+        )
+
     # Build position list in a vertical-S (column-major boustrophedon) pattern:
     # matches the preset scan order — start top-left, go top-to-bottom down each
     # column, shift right to the next column, then alternate direction.
