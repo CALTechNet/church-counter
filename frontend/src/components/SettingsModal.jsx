@@ -13,28 +13,59 @@ const C = {
 }
 
 const label  = { fontSize: 12, color: C.muted, marginBottom: 4, display: 'block' }
-const input  = { width: '100%', background: C.bg, border: `1px solid ${C.border}`, color: C.text, borderRadius: 6, padding: '8px 10px', fontSize: 13, boxSizing: 'border-box', outline: 'none' }
+const inputStyle  = { width: '100%', background: C.bg, border: `1px solid ${C.border}`, color: C.text, borderRadius: 6, padding: '8px 10px', fontSize: 13, boxSizing: 'border-box', outline: 'none' }
 const section      = { marginBottom: 22 }
 const sectionTitle = { fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: C.muted, marginBottom: 12, paddingBottom: 6, borderBottom: `1px solid ${C.border}` }
 const field        = { marginBottom: 12 }
 
+let _nextId = 1
+function genId() { return `room_${Date.now()}_${_nextId++}` }
+
+function defaultRoom() {
+  return {
+    id: genId(),
+    name: '',
+    camera_type: 'ptz_optics',
+    camera_ip: '',
+    camera_user: 'admin',
+    camera_pass: 'admin',
+    scan_mode: 'preset',
+    preset_start: 100,
+    preset_end: 131,
+    rtsp_url: '',
+  }
+}
+
 export default function SettingsModal({ onClose, onSave }) {
   const [cfg, setCfg] = useState({
-    church_name:  'Lakeshore Church',
-    camera_ip:    '10.10.140.140',
-    camera_user:  'admin',
-    camera_pass:  'admin',
-    scan_mode:    'preset',
-    preset_start: 100,
-    preset_end:   131,
+    church_name: 'Lakeshore Church',
+    rooms: [],
   })
-  const [saving, setSaving]       = useState(false)
-  const [msg,    setMsg]          = useState(null)
-  const [bounds, setBounds]       = useState(null)
+  const [saving, setSaving]   = useState(false)
+  const [msg, setMsg]         = useState(null)
+  const [bounds, setBounds]   = useState(null)
+  const [expandedRoom, setExpandedRoom] = useState(null)
 
   useEffect(() => {
     getSettings()
-      .then(s => setCfg(prev => ({ ...prev, ...s })))
+      .then(s => {
+        const rooms = s.rooms && s.rooms.length > 0
+          ? s.rooms
+          : [{
+              id: 'default',
+              name: 'Sanctuary',
+              camera_type: 'ptz_optics',
+              camera_ip: s.camera_ip || '10.10.140.140',
+              camera_user: s.camera_user || 'admin',
+              camera_pass: s.camera_pass || 'admin',
+              scan_mode: s.scan_mode || 'preset',
+              preset_start: s.preset_start ?? 100,
+              preset_end: s.preset_end ?? 131,
+              rtsp_url: '',
+            }]
+        setCfg({ church_name: s.church_name || 'Lakeshore Church', rooms })
+        if (rooms.length > 0) setExpandedRoom(rooms[0].id)
+      })
       .catch(() => {})
     getCameraBounds()
       .then(b => setBounds(b))
@@ -43,13 +74,53 @@ export default function SettingsModal({ onClose, onSave }) {
 
   const set = (key, val) => setCfg(prev => ({ ...prev, [key]: val }))
 
+  const updateRoom = (roomId, key, val) => {
+    setCfg(prev => ({
+      ...prev,
+      rooms: prev.rooms.map(r => r.id === roomId ? { ...r, [key]: val } : r),
+    }))
+  }
+
+  const addRoom = () => {
+    const newRoom = defaultRoom()
+    setCfg(prev => ({ ...prev, rooms: [...prev.rooms, newRoom] }))
+    setExpandedRoom(newRoom.id)
+  }
+
+  const removeRoom = (roomId) => {
+    setCfg(prev => {
+      const rooms = prev.rooms.filter(r => r.id !== roomId)
+      return { ...prev, rooms }
+    })
+    if (expandedRoom === roomId) {
+      setCfg(prev => {
+        if (prev.rooms.length > 0) setExpandedRoom(prev.rooms[0].id)
+        return prev
+      })
+    }
+  }
+
   const handleSave = async () => {
     setSaving(true)
     setMsg(null)
     try {
-      await saveSettings(cfg)
+      // Also keep flat camera fields synced from first room for backward compat
+      const firstRoom = cfg.rooms[0]
+      const payload = {
+        church_name: cfg.church_name,
+        rooms: cfg.rooms,
+      }
+      if (firstRoom && firstRoom.camera_type === 'ptz_optics') {
+        payload.camera_ip = firstRoom.camera_ip
+        payload.camera_user = firstRoom.camera_user
+        payload.camera_pass = firstRoom.camera_pass
+        payload.scan_mode = firstRoom.scan_mode
+        payload.preset_start = firstRoom.preset_start
+        payload.preset_end = firstRoom.preset_end
+      }
+      await saveSettings(payload)
       setMsg({ text: 'Settings saved!', ok: true })
-      setTimeout(() => { onSave?.(cfg); onClose() }, 1000)
+      setTimeout(() => { onSave?.(payload); onClose() }, 1000)
     } catch (e) {
       setMsg({ text: `Error: ${e.message}`, ok: false })
     } finally {
@@ -57,17 +128,14 @@ export default function SettingsModal({ onClose, onSave }) {
     }
   }
 
-  const presetCount = Math.max(0, (cfg.preset_end ?? 131) - (cfg.preset_start ?? 100) + 1)
-
   const calGrid = (() => {
     const tl = bounds?.top_left
     const br = bounds?.bottom_right
     if (!tl || !br) return null
-    const zoom     = Math.max(1, bounds?.zoom || tl?.zoom || 10000)
-    // step = 1_250_000 / zoom - 50  (calibrated: zoom=10000→75, zoom=5000→200)
-    const step     = Math.max(25, Math.floor(1250000 / zoom) - 50)
-    const cols     = Math.max(1, Math.ceil(Math.abs(br.pan  - tl.pan)  / step) + 1)
-    const rows     = Math.max(1, Math.ceil(Math.abs(br.tilt - tl.tilt) / step) + 1)
+    const zoom = Math.max(1, bounds?.zoom || tl?.zoom || 10000)
+    const step = Math.max(25, Math.floor(1250000 / zoom) - 50)
+    const cols = Math.max(1, Math.ceil(Math.abs(br.pan - tl.pan) / step) + 1)
+    const rows = Math.max(1, Math.ceil(Math.abs(br.tilt - tl.tilt) / step) + 1)
     return { cols, rows, total: cols * rows, zoom, step }
   })()
 
@@ -78,7 +146,7 @@ export default function SettingsModal({ onClose, onSave }) {
     }}>
       <div style={{
         background: C.surface, borderRadius: 12, border: `1px solid ${C.border}`,
-        width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto',
+        width: '100%', maxWidth: 520, maxHeight: '90vh', overflowY: 'auto',
         padding: 24, boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
       }}>
 
@@ -93,90 +161,193 @@ export default function SettingsModal({ onClose, onSave }) {
           <div style={sectionTitle}>Church</div>
           <div style={field}>
             <label style={label}>Church Name</label>
-            <input style={input} value={cfg.church_name} onChange={e => set('church_name', e.target.value)} />
+            <input style={inputStyle} value={cfg.church_name} onChange={e => set('church_name', e.target.value)} />
           </div>
         </div>
 
-        {/* Camera */}
+        {/* Rooms / Cameras */}
         <div style={section}>
-          <div style={sectionTitle}>Camera</div>
-          <div style={field}>
-            <label style={label}>IP Address</label>
-            <input style={input} value={cfg.camera_ip} onChange={e => set('camera_ip', e.target.value)} placeholder="10.10.140.140" />
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-            <div style={field}>
-              <label style={label}>Username</label>
-              <input style={input} value={cfg.camera_user} onChange={e => set('camera_user', e.target.value)} />
-            </div>
-            <div style={field}>
-              <label style={label}>Password</label>
-              <input type="password" style={input} value={cfg.camera_pass} onChange={e => set('camera_pass', e.target.value)} />
-            </div>
-          </div>
-        </div>
-
-        {/* Scan Mode */}
-        <div style={section}>
-          <div style={sectionTitle}>Scan Mode</div>
-          <div style={field}>
-            <label style={label}>Scanning Method</label>
-            <select
-              style={{ ...input, cursor: 'pointer' }}
-              value={cfg.scan_mode}
-              onChange={e => set('scan_mode', e.target.value)}
-            >
-              <option value="preset">Preset Scanning</option>
-              <option value="calibrated">Calibrated Scanning</option>
-            </select>
+          <div style={{ ...sectionTitle, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span>Rooms & Cameras</span>
+            <button
+              onClick={addRoom}
+              title="Add room"
+              style={{
+                background: C.accent, color: '#fff', border: 'none', borderRadius: 6,
+                width: 26, height: 26, fontSize: 16, fontWeight: 700, cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', lineHeight: 1,
+              }}
+            >+</button>
           </div>
 
-          {cfg.scan_mode === 'preset' && (
-            <div style={{ background: C.bg, borderRadius: 8, padding: 16, border: `1px solid ${C.border}` }}>
-              <p style={{ margin: '0 0 12px', fontSize: 12, color: C.muted }}>
-                Visits saved camera presets in sequence. Presets must be programmed into the camera in advance.
-              </p>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                <div>
-                  <label style={label}>First Preset #</label>
-                  <input type="number" style={input} value={cfg.preset_start} min={0} max={255}
-                    onChange={e => set('preset_start', parseInt(e.target.value) || 0)} />
+          {cfg.rooms.map((room, idx) => {
+            const isExpanded = expandedRoom === room.id
+            const presetCount = Math.max(0, (room.preset_end ?? 131) - (room.preset_start ?? 100) + 1)
+
+            return (
+              <div key={room.id} style={{
+                background: C.bg, borderRadius: 8, border: `1px solid ${C.border}`,
+                marginBottom: 10, overflow: 'hidden',
+              }}>
+                {/* Room header — click to expand/collapse */}
+                <div
+                  onClick={() => setExpandedRoom(isExpanded ? null : room.id)}
+                  style={{
+                    padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10,
+                    cursor: 'pointer', userSelect: 'none',
+                  }}
+                >
+                  <span style={{ fontSize: 12, color: C.muted, transform: isExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}>▶</span>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: C.text, flex: 1 }}>
+                    {room.name || `Room ${idx + 1}`}
+                  </span>
+                  <span style={{ fontSize: 11, color: C.muted, background: C.surface, borderRadius: 4, padding: '2px 8px' }}>
+                    {room.camera_type === 'rtsp' ? 'RTSP' : 'PTZ Optics'}
+                  </span>
+                  {cfg.rooms.length > 1 && (
+                    <button
+                      onClick={e => { e.stopPropagation(); removeRoom(room.id) }}
+                      title="Remove room"
+                      style={{
+                        background: 'transparent', border: 'none', color: C.red,
+                        fontSize: 14, cursor: 'pointer', padding: '0 4px', lineHeight: 1,
+                      }}
+                    >✕</button>
+                  )}
                 </div>
-                <div>
-                  <label style={label}>Last Preset #</label>
-                  <input type="number" style={input} value={cfg.preset_end} min={0} max={255}
-                    onChange={e => set('preset_end', parseInt(e.target.value) || 0)} />
-                </div>
+
+                {/* Room details — expanded */}
+                {isExpanded && (
+                  <div style={{ padding: '0 14px 14px' }}>
+                    {/* Room name */}
+                    <div style={field}>
+                      <label style={label}>Room Name</label>
+                      <input
+                        style={inputStyle}
+                        value={room.name}
+                        onChange={e => updateRoom(room.id, 'name', e.target.value)}
+                        placeholder="e.g. Sanctuary, Fellowship Hall"
+                      />
+                    </div>
+
+                    {/* Camera type */}
+                    <div style={field}>
+                      <label style={label}>Camera Type</label>
+                      <select
+                        style={{ ...inputStyle, cursor: 'pointer' }}
+                        value={room.camera_type}
+                        onChange={e => updateRoom(room.id, 'camera_type', e.target.value)}
+                      >
+                        <option value="ptz_optics">PTZ Optics</option>
+                        <option value="rtsp">Generic RTSP</option>
+                      </select>
+                    </div>
+
+                    {/* PTZ Optics fields */}
+                    {room.camera_type === 'ptz_optics' && (
+                      <>
+                        <div style={field}>
+                          <label style={label}>IP Address</label>
+                          <input
+                            style={inputStyle}
+                            value={room.camera_ip}
+                            onChange={e => updateRoom(room.id, 'camera_ip', e.target.value)}
+                            placeholder="10.10.140.140"
+                          />
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                          <div style={field}>
+                            <label style={label}>Username</label>
+                            <input style={inputStyle} value={room.camera_user} onChange={e => updateRoom(room.id, 'camera_user', e.target.value)} />
+                          </div>
+                          <div style={field}>
+                            <label style={label}>Password</label>
+                            <input type="password" style={inputStyle} value={room.camera_pass} onChange={e => updateRoom(room.id, 'camera_pass', e.target.value)} />
+                          </div>
+                        </div>
+
+                        {/* Scan mode */}
+                        <div style={field}>
+                          <label style={label}>Scan Mode</label>
+                          <select
+                            style={{ ...inputStyle, cursor: 'pointer' }}
+                            value={room.scan_mode}
+                            onChange={e => updateRoom(room.id, 'scan_mode', e.target.value)}
+                          >
+                            <option value="preset">Preset Scanning</option>
+                            <option value="calibrated">Calibrated Scanning</option>
+                          </select>
+                        </div>
+
+                        {room.scan_mode === 'preset' && (
+                          <div style={{ background: C.surface, borderRadius: 6, padding: 12, border: `1px solid ${C.border}` }}>
+                            <p style={{ margin: '0 0 10px', fontSize: 11, color: C.muted }}>
+                              Visits saved camera presets in sequence.
+                            </p>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                              <div>
+                                <label style={label}>First Preset #</label>
+                                <input type="number" style={inputStyle} value={room.preset_start} min={0} max={255}
+                                  onChange={e => updateRoom(room.id, 'preset_start', parseInt(e.target.value) || 0)} />
+                              </div>
+                              <div>
+                                <label style={label}>Last Preset #</label>
+                                <input type="number" style={inputStyle} value={room.preset_end} min={0} max={255}
+                                  onChange={e => updateRoom(room.id, 'preset_end', parseInt(e.target.value) || 0)} />
+                              </div>
+                            </div>
+                            <p style={{ margin: '8px 0 0', fontSize: 11, color: C.muted }}>
+                              Total: {presetCount} preset{presetCount !== 1 ? 's' : ''}
+                            </p>
+                          </div>
+                        )}
+
+                        {room.scan_mode === 'calibrated' && (
+                          <div style={{ background: C.surface, borderRadius: 6, padding: 12, border: `1px solid ${C.border}` }}>
+                            <p style={{ margin: '0 0 10px', fontSize: 11, color: C.muted }}>
+                              Moves camera through a grid of absolute positions using saved bounds.
+                            </p>
+                            {calGrid ? (
+                              <div style={{ fontSize: 11, color: C.muted }}>
+                                <div style={{ marginBottom: 2 }}>Estimated frames: <strong style={{ color: C.text }}>{calGrid.total}</strong></div>
+                                <div>{calGrid.cols} col{calGrid.cols !== 1 ? 's' : ''} × {calGrid.rows} row{calGrid.rows !== 1 ? 's' : ''} · zoom {calGrid.zoom} · step {calGrid.step}</div>
+                                <div>~{Math.max(1, Math.round((calGrid.total * 1.5 + 3) / 60))} min</div>
+                              </div>
+                            ) : (
+                              <p style={{ margin: 0, fontSize: 11, color: C.muted, fontStyle: 'italic' }}>
+                                No bounds saved — set in Calibration tab first.
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {/* Generic RTSP fields */}
+                    {room.camera_type === 'rtsp' && (
+                      <div style={field}>
+                        <label style={label}>RTSP URL</label>
+                        <input
+                          style={inputStyle}
+                          value={room.rtsp_url}
+                          onChange={e => updateRoom(room.id, 'rtsp_url', e.target.value)}
+                          placeholder="rtsp://192.168.1.100:554/stream"
+                        />
+                        <p style={{ margin: '6px 0 0', fontSize: 11, color: C.muted }}>
+                          A single frame will be captured from this feed for each scan.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
-              <p style={{ margin: '10px 0 0', fontSize: 11, color: C.muted }}>
-                Total: {presetCount} preset{presetCount !== 1 ? 's' : ''}
-              </p>
-            </div>
-          )}
+            )
+          })}
 
-          {cfg.scan_mode === 'calibrated' && (
-            <div style={{ background: C.bg, borderRadius: 8, padding: 16, border: `1px solid ${C.border}` }}>
-              <p style={{ margin: '0 0 12px', fontSize: 12, color: C.muted }}>
-                Moves the camera left-to-right through a grid of absolute positions using the bounds saved in Calibration. Grid density is calculated from the saved zoom level.
-              </p>
-              {calGrid ? (
-                <div style={{ background: C.surface, borderRadius: 6, padding: '10px 14px', border: `1px solid ${C.border}` }}>
-                  <div style={{ fontSize: 13, color: C.text, marginBottom: 4 }}>
-                    Estimated frames: <strong>{calGrid.total}</strong>
-                  </div>
-                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>
-                    {calGrid.cols} col{calGrid.cols !== 1 ? 's' : ''} × {calGrid.rows} row{calGrid.rows !== 1 ? 's' : ''} &nbsp;·&nbsp; zoom {calGrid.zoom} &nbsp;·&nbsp; step {calGrid.step} units
-                  </div>
-                  <div style={{ fontSize: 11, color: C.muted }}>
-                    ~{Math.max(1, Math.round((calGrid.total * 1.5 + 3) / 60))} min{Math.max(1, Math.round((calGrid.total * 1.5 + 3) / 60)) !== 1 ? 's' : ''}
-                  </div>
-                </div>
-              ) : (
-                <p style={{ margin: 0, fontSize: 11, color: C.muted, fontStyle: 'italic' }}>
-                  No calibration bounds saved — set bounds in the Calibration tab first.
-                </p>
-              )}
-            </div>
+          {cfg.rooms.length === 0 && (
+            <p style={{ fontSize: 12, color: C.muted, fontStyle: 'italic', textAlign: 'center', padding: 16 }}>
+              No rooms configured. Click + to add one.
+            </p>
           )}
         </div>
 
