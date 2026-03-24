@@ -3,9 +3,10 @@ Frame stitching for panorama generation.
 Primary: OpenCV Stitcher (RANSAC-based feature matching), batched
 Fallback: Horizontal concat (resized to common height)
 
-Low-light fix: frames are contrast-enhanced before feature detection
-so the stitcher finds enough keypoints at 52% house lights.
-The saved/displayed image uses the original brightness.
+Low-light fix: frames are contrast-enhanced (CLAHE + gamma lift) on the
+raw numpy arrays immediately after deduplication — before any JPEG
+compression — so the stitcher receives the highest-quality enhanced
+input for keypoint detection and alignment.
 
 Batching fix: frames are split into small batches before stitching
 to prevent OpenCV's bundle adjuster from consuming excessive memory
@@ -13,8 +14,9 @@ and crashing the machine.
 
 Memory fix: waiting frames are JPEG-compressed in memory (~600 KB each
 vs ~6 MB raw) so 76 frames occupy ~45 MB instead of ~456 MB while
-batches are processed. Only the active batch is decompressed to full-res
-numpy arrays, so stitching quality and output resolution are unchanged.
+batches are processed. Enhancement runs on the raw frames before
+compression, so the JPEG only needs to store the already-enhanced image
+and no re-enhancement is needed after decoding.
 """
 import base64
 import gc
@@ -63,12 +65,20 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     unique = _deduplicate(frames)
     logger.info(f"Stitching {len(unique)} unique frames (from {len(frames)} captured)")
 
+    # Enhance all frames on the raw numpy arrays before any JPEG compression.
+    # Running CLAHE+gamma on the original data gives the stitcher the best
+    # possible keypoints; the JPEG only stores the already-enhanced result so
+    # no lossy round-trip degrades the data before enhancement.
+    with ThreadPoolExecutor() as pool:
+        unique = list(pool.map(_enhance_for_stitching, unique))
+    logger.info(f"Enhanced {len(unique)} frames on raw data")
+
     if len(unique) <= BATCH_SIZE:
         return _stitch_batch(unique)
 
-    # JPEG-compress waiting frames so 76×~6 MB raw → 76×~600 KB in memory.
-    # Only the active batch is decompressed to full-res arrays; output resolution
-    # is unchanged because the stitcher always receives original-quality frames.
+    # JPEG-compress enhanced frames so 76×~6 MB → 76×~600 KB in memory.
+    # Only the active batch is decompressed to full-res arrays; no
+    # re-enhancement is needed after decoding.
     n_batches = math.ceil(len(unique) / BATCH_SIZE)
     logger.info(f"Stitching in {n_batches} batches of up to {BATCH_SIZE} frames")
     compressed = [cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
@@ -131,32 +141,20 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
 
 
 def _stitch_batch(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
-    """Stitch a small batch of frames using OpenCV stitcher with low-light enhancement."""
+    """Stitch a small batch of pre-enhanced frames using OpenCV stitcher."""
     if len(frames) == 1:
         return frames[0], "single_frame"
 
-    # Try stitching with enhanced frames first (better keypoint detection in low light)
-    with ThreadPoolExecutor() as pool:
-        enhanced = list(pool.map(_enhance_for_stitching, frames))
-
+    # Frames are already enhanced (CLAHE+gamma applied on raw data upstream).
     stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
-    status, pano = stitcher.stitch(enhanced)
+    status, pano = stitcher.stitch(frames)
     if status == cv2.Stitcher_OK:
         pano = _crop_black(pano)
-        logger.info(f"Batch stitch OK (enhanced) — shape {pano.shape}")
+        logger.info(f"Batch stitch OK — shape {pano.shape}")
         return pano, "ok"
 
-    logger.warning(f"Enhanced batch stitch failed (status={status}), trying original frames…")
-
-    # Retry with original frames
-    status2, pano2 = stitcher.stitch(frames)
-    if status2 == cv2.Stitcher_OK:
-        pano2 = _crop_black(pano2)
-        logger.info(f"Batch stitch OK (original) — shape {pano2.shape}")
-        return pano2, "ok_original"
-
-    logger.warning(f"Batch stitch failed (status={status2})")
-    return None, f"failed_{status2}"
+    logger.warning(f"Batch stitch failed (status={status})")
+    return None, f"failed_{status}"
 
 
 def _concat_fallback(frames: List[np.ndarray]) -> np.ndarray:

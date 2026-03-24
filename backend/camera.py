@@ -588,13 +588,13 @@ async def _calibrated_scan(
         frames.append(f)
     await prog(f"Position 1/{total} (pan={pan0}, tilt={tilt0}) — {len(frames)} total", 0)
 
-    # Move through remaining positions; wait 10ms after each move, then capture
+    # Move through remaining positions; wait 25ms after each move for vibration to settle, then capture
     for i, (pan, tilt) in enumerate(positions[1:], 1):
         if cancelled():
             return frames
         pct = int((i / total) * 88)
         await move_abs(pan, tilt, pan_speed=24, tilt_speed=20)
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.025)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
