@@ -368,8 +368,7 @@ async def _preset_scan(
     presets: List[int],
     progress_callback: Optional[ProgressCB] = None,
 ) -> List[np.ndarray]:
-    """Visit a list of VISCA presets, issuing each move 300ms apart and capturing
-    frames continuously during every travel window (including intermediary frames).
+    """Visit a list of VISCA presets, capturing one frame immediately after each move.
     Navigates to the first preset and waits 1.5s to settle before scanning."""
     frames: List[np.ndarray] = []
     total = len(presets)
@@ -395,17 +394,15 @@ async def _preset_scan(
         frames.append(f)
     await prog(f"Preset {presets[0]} (1/{total}) — {len(frames)} total", 0)
 
-    # Move through remaining presets; capture all frames possible in each 300ms window
+    # Move through remaining presets; capture one frame after each move
     for i, preset_id in enumerate(presets[1:], 1):
         pct = int((i / total) * 88)
         await call_preset(preset_id)
-        deadline = time.monotonic() + 0.3
+        f = await asyncio.to_thread(capture_frame)
         frames_this = 0
-        while time.monotonic() < deadline:
-            f = await asyncio.to_thread(capture_frame)
-            if f is not None:
-                frames.append(f)
-                frames_this += 1
+        if f is not None:
+            frames.append(f)
+            frames_this += 1
 
         await prog(
             f"Preset {preset_id} ({i+1}/{total}) — {frames_this} frames, {len(frames)} total",
@@ -486,17 +483,15 @@ async def _calibrated_scan(
         frames.append(f)
     await prog(f"Position 1/{total} (pan={pan0}, tilt={tilt0}) — {len(frames)} total", 0)
 
-    # Move through remaining positions; capture all frames possible in each 300ms window
+    # Move through remaining positions; capture one frame after each move
     for i, (pan, tilt) in enumerate(positions[1:], 1):
         pct = int((i / total) * 88)
         await move_abs(pan, tilt)
-        deadline = time.monotonic() + 0.3
+        f = await asyncio.to_thread(capture_frame)
         frames_this = 0
-        while time.monotonic() < deadline:
-            f = await asyncio.to_thread(capture_frame)
-            if f is not None:
-                frames.append(f)
-                frames_this += 1
+        if f is not None:
+            frames.append(f)
+            frames_this += 1
 
         await prog(
             f"Position {i+1}/{total} (pan={pan}, tilt={tilt}) — {frames_this} frames, {len(frames)} total",
