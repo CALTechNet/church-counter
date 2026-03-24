@@ -259,10 +259,14 @@ def _composite_homography(
     canvas_w = int(np.ceil(max_x - min_x))
     canvas_h = int(np.ceil(max_y - min_y))
 
-    # Cap canvas to prevent memory blow-up
-    max_dim = 16000
-    if max(canvas_w, canvas_h) > max_dim:
-        s = max_dim / max(canvas_w, canvas_h)
+    # Cap canvas to prevent memory blow-up.
+    # Limit by total pixel area (not just max dimension) so wide panoramas
+    # like 16000×6522 (~104 Mpx) don't OOM a 4 GB container.
+    # 40 Mpx ≈ peak ~2.2 GB with float32 buffers — safe for 4 GB limit.
+    max_pixels = 40_000_000
+    n_pixels = canvas_w * canvas_h
+    if n_pixels > max_pixels:
+        s = (max_pixels / n_pixels) ** 0.5
         S = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float64)
         T = S @ T
         canvas_w = int(canvas_w * s)
@@ -270,8 +274,8 @@ def _composite_homography(
 
     logger.info(f"Canvas size: {canvas_w} × {canvas_h}")
 
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float64)
-    weight = np.zeros((canvas_h, canvas_w), dtype=np.float64)
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
+    weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
 
     for i, (frame, H) in enumerate(zip(frames, homographies)):
         H_final = T @ H
@@ -301,9 +305,9 @@ def _composite_homography(
 
         # Distance transform gives smooth per-pixel blending weights
         # (high in the centre of the valid area, tapering to zero at edges)
-        dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5).astype(np.float64)
+        dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5)
 
-        canvas += warped.astype(np.float64) * dist[:, :, None]
+        canvas += warped.astype(np.float32) * dist[:, :, None]
         weight += dist
 
         if (i + 1) % 10 == 0 or i == len(frames) - 1:
