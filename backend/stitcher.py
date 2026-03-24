@@ -1,16 +1,24 @@
 """
-Frame stitching for panorama generation.
-Primary: OpenCV Stitcher (RANSAC-based feature matching)
-Fallback: Horizontal concat (resized to common height)
+Incremental panorama stitcher for sequential PTZ camera frames.
 
-Low-light fix: frames are contrast-enhanced before feature detection
-so the stitcher finds enough keypoints at 52% house lights.
-The saved/displayed image uses the original brightness.
+Each consecutive frame overlaps its neighbour.  Rather than using OpenCV's
+high-level Stitcher (which estimates full homographies and breaks when the
+accumulator outgrows a single frame), we:
 
-Crash prevention: only ever stitch 2 frames at a time, then
-accumulate by stitching the running result with the next frame.
-This keeps OpenCV memory usage minimal and avoids native segfaults.
+  1. Enhance every raw frame (CLAHE + gamma) for better feature detection.
+  2. Detect ORB features and match consecutive pairs to find the
+     translation offset between them.
+  3. Accumulate absolute (x, y) positions for every frame.
+  4. Composite all frames onto one canvas with linear-blend seams.
+
+The result is a single large image built from the *original* (un-enhanced)
+frames so no data is lost.  The final output is returned as a numpy array
+and can be compressed to JPEG at the caller's discretion.
+
+For very large runs (>100 frames) the pipeline works identically — offsets
+are O(n) pairwise computations and the final composite is a single pass.
 """
+
 import base64
 import gc
 import logging
@@ -21,340 +29,165 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Enhancement (applied to raw frames *before* feature detection)
+# ---------------------------------------------------------------------------
 
-def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
+def enhance_frame(frame: np.ndarray) -> np.ndarray:
     """
-    Boost contrast/brightness for feature detection only.
-    CLAHE on L channel + gamma lift so ORB/SIFT find more keypoints in dark frames.
+    Boost contrast + brightness so ORB finds keypoints in dark sanctuary
+    frames.  CLAHE on the L channel of LAB + a gamma 2.0 lift.
     """
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     l = clahe.apply(l)
     enhanced = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
-    # Gamma 2.0 lift
-    lut = np.array([((i / 255.0) ** (1.0 / 2.0)) * 255 for i in range(256)], dtype=np.uint8)
+    lut = np.array(
+        [((i / 255.0) ** (1.0 / 2.0)) * 255 for i in range(256)],
+        dtype=np.uint8,
+    )
     return cv2.LUT(enhanced, lut)
 
 
-def _stitch_pair(a: np.ndarray, b: np.ndarray) -> Optional[np.ndarray]:
+# ---------------------------------------------------------------------------
+# Pairwise offset estimation
+# ---------------------------------------------------------------------------
+
+_ORB_FEATURES = 3000          # keypoints per frame
+_MATCH_RATIO  = 0.75          # Lowe's ratio test threshold
+_RANSAC_REPROJ = 5.0          # RANSAC reprojection threshold (px)
+_MIN_INLIERS  = 8             # minimum matches to trust an offset
+
+
+def _estimate_offset(
+    frame_a: np.ndarray,
+    frame_b: np.ndarray,
+) -> Optional[Tuple[float, float]]:
     """
-    Stitch exactly 2 frames. Tries enhanced first, then original.
-    Returns None on failure.
+    Estimate the (dx, dy) translation that maps *frame_b* onto the
+    coordinate system of *frame_a*.  Returns None if matching fails.
+
+    Positive dx → frame_b is to the right of frame_a.
+    Positive dy → frame_b is below frame_a.
     """
-    try:
-        enhanced = [_enhance_for_stitching(a), _enhance_for_stitching(b)]
-        stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
-        status, pano = stitcher.stitch(enhanced)
-        del enhanced, stitcher
-        gc.collect()
+    # Work on grayscale, down-scaled for speed
+    h_a, w_a = frame_a.shape[:2]
+    h_b, w_b = frame_b.shape[:2]
+    scale = min(1.0, 800.0 / max(h_a, w_a, h_b, w_b))
 
-        if status == cv2.Stitcher_OK:
-            return pano
+    gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
+    gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+    if scale < 1.0:
+        gray_a = cv2.resize(gray_a, None, fx=scale, fy=scale)
+        gray_b = cv2.resize(gray_b, None, fx=scale, fy=scale)
 
-        logger.debug(f"Enhanced pair stitch failed (status={status}), trying originals")
-        stitcher2 = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
-        status2, pano2 = stitcher2.stitch([a, b])
-        del stitcher2
-        gc.collect()
+    orb = cv2.ORB_create(nfeatures=_ORB_FEATURES)
+    kp_a, des_a = orb.detectAndCompute(gray_a, None)
+    kp_b, des_b = orb.detectAndCompute(gray_b, None)
 
-        if status2 == cv2.Stitcher_OK:
-            return pano2
+    if des_a is None or des_b is None or len(kp_a) < 4 or len(kp_b) < 4:
+        return None
 
-    except Exception as exc:
-        logger.warning(f"Stitch pair exception: {exc}")
-        gc.collect()
+    # Brute-force Hamming match + Lowe's ratio test
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    raw_matches = bf.knnMatch(des_a, des_b, k=2)
 
-    return None
+    good = []
+    for m_pair in raw_matches:
+        if len(m_pair) == 2:
+            m, n = m_pair
+            if m.distance < _MATCH_RATIO * n.distance:
+                good.append(m)
+
+    if len(good) < _MIN_INLIERS:
+        return None
+
+    pts_a = np.float32([kp_a[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    pts_b = np.float32([kp_b[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+    # Estimate affine (translation + rotation + scale) via RANSAC
+    # We only really expect translation, but allowing affine handles minor
+    # camera rotation between presets.
+    M, inliers = cv2.estimateAffinePartial2D(
+        pts_b, pts_a, method=cv2.RANSAC, ransacReprojThreshold=_RANSAC_REPROJ
+    )
+
+    if M is None:
+        return None
+
+    n_inliers = int(inliers.sum()) if inliers is not None else 0
+    if n_inliers < _MIN_INLIERS:
+        return None
+
+    # Translation component of the 2×3 affine matrix, scaled back up
+    dx = M[0, 2] / scale
+    dy = M[1, 2] / scale
+
+    logger.debug(
+        f"Offset: dx={dx:.1f}  dy={dy:.1f}  "
+        f"({n_inliers}/{len(good)} inliers, scale={M[0,0]:.3f})"
+    )
+    return (dx, dy)
 
 
-def _find_horizontal_overlap(a: np.ndarray, b: np.ndarray, max_overlap: float = 0.75) -> int:
+def _template_offset(
+    frame_a: np.ndarray,
+    frame_b: np.ndarray,
+) -> Optional[Tuple[float, float]]:
     """
-    Find horizontal overlap between two frames using template matching.
-    Searches the right portion of `a` for the left edge strip of `b`.
-    Returns the overlap in pixels (0 if none found).
+    Fallback offset estimation using template matching when ORB fails.
+    Uses a center crop of frame_b as a template searched within frame_a's
+    extended region.
     """
-    ha, wa = a.shape[:2]
-    hb, wb = b.shape[:2]
-    h = min(ha, hb)
+    h_a, w_a = frame_a.shape[:2]
+    h_b, w_b = frame_b.shape[:2]
 
     # Downscale for speed
-    scale = min(1.0, 400.0 / h)
-    sh = int(h * scale)
-    swa = int(wa * scale)
-    swb = int(wb * scale)
-    if sh < 16 or swa < 16 or swb < 16:
-        return 0
-
-    ga = cv2.cvtColor(cv2.resize(a[:h], (swa, sh)), cv2.COLOR_BGR2GRAY)
-    gb = cv2.cvtColor(cv2.resize(b[:h], (swb, sh)), cv2.COLOR_BGR2GRAY)
-
-    # Template: left strip of b (15% of its width)
-    strip_w = max(8, int(swb * 0.15))
-    template = gb[:, :strip_w]
-
-    # Search region: right portion of a (up to max_overlap of a's width)
-    search_w = int(swa * max_overlap)
-    search_region = ga[:, swa - search_w:]
-
-    if search_region.shape[1] < template.shape[1]:
-        return 0
-
-    res = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(res)
-
-    if max_val < 0.3:
-        return 0
-
-    # Overlap = distance from match position to right edge of search region
-    overlap_scaled = search_w - max_loc[0]
-    overlap = int(overlap_scaled / scale)
-    return max(0, min(overlap, int(wa * max_overlap), wb))
-
-
-def _blend_horizontal(a: np.ndarray, b: np.ndarray, overlap: int) -> np.ndarray:
-    """Merge two frames with a linear blend across the overlap zone."""
-    ha, wa = a.shape[:2]
-    hb, wb = b.shape[:2]
-    h = min(ha, hb)
-    a = a[:h]
-    b = b[:h]
-
-    out_w = wa + wb - overlap
-    result = np.zeros((h, out_w, 3), dtype=np.uint8)
-
-    # Left part (non-overlapping portion of a)
-    result[:, :wa - overlap] = a[:, :wa - overlap]
-    # Right part (non-overlapping portion of b)
-    result[:, wa:] = b[:, overlap:]
-
-    # Blend the overlap region
-    if overlap > 0:
-        alpha = np.linspace(1, 0, overlap, dtype=np.float32).reshape(1, -1, 1)
-        region_a = a[:, wa - overlap:].astype(np.float32)
-        region_b = b[:, :overlap].astype(np.float32)
-        result[:, wa - overlap:wa] = (region_a * alpha + region_b * (1 - alpha)).astype(np.uint8)
-
-    return result
-
-
-def _hconcat_pair(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Join two frames, detecting and blending any horizontal overlap."""
-    target_h = min(a.shape[0], b.shape[0])
-    ha, wa = a.shape[:2]
-    hb, wb = b.shape[:2]
-    ra = cv2.resize(a, (int(wa * target_h / ha), target_h))
-    rb = cv2.resize(b, (int(wb * target_h / hb), target_h))
-
-    overlap = _find_horizontal_overlap(ra, rb)
-    if overlap > 0:
-        logger.info(f"    Found {overlap}px horizontal overlap, blending")
-        return _blend_horizontal(ra, rb, overlap)
-
-    return np.hstack([ra, rb])
-
-
-def _stitch_sequential(frames: List[np.ndarray], label: str = "") -> np.ndarray:
-    """
-    Stitch a list of frames by accumulating one at a time:
-      result = frames[0]
-      result = stitch(result, frames[1])
-      result = stitch(result, frames[2])
-      ...
-    Falls back to hconcat for any pair that fails.
-    """
-    result = frames[0]
-    for i, frame in enumerate(frames[1:], 1):
-        logger.info(f"  {label}Stitching frame {i + 1}/{len(frames)}")
-        merged = _stitch_pair(result, frame)
-        if merged is not None:
-            result = merged
-        else:
-            logger.warning(f"  {label}Pair stitch failed at frame {i + 1}, using hconcat")
-            result = _hconcat_pair(result, frame)
-        gc.collect()
-    return result
-
-
-def stitch_frames(
-    frames: List[np.ndarray],
-    grid_shape: Optional[Tuple[int, int]] = None,
-) -> Tuple[Optional[np.ndarray], str]:
-    """
-    Stitch frames into a panorama.
-
-    When grid_shape (rows, cols) is provided (calibrated PTZ scan), frames are
-    assumed to be in column-major boustrophedon order (down col 0, up col 1, …).
-    They are rearranged into rows, each row is stitched independently, then
-    rows are vertically concatenated.  This avoids the accumulator-growth
-    problem where a huge panorama can't match features with a small new frame.
-
-    Without grid_shape, falls back to sequential pair-wise stitching with
-    deduplication.
-
-    Returns (image, status_message).
-    """
-    if not frames:
-        return None, "no_frames"
-
-    if len(frames) == 1:
-        return frames[0], "single_frame"
-
-    if grid_shape and len(grid_shape) == 2:
-        rows, cols = grid_shape
-        if rows * cols == len(frames):
-            return _stitch_grid(frames, rows, cols)
-        logger.warning(
-            f"grid_shape {grid_shape} doesn't match frame count {len(frames)}, "
-            "falling back to sequential stitch"
-        )
-
-    # Fallback: sequential stitch with deduplication
-    unique = _deduplicate(frames)
-    n = len(unique)
-    logger.info(f"Stitching {n} unique frames (from {len(frames)} captured)")
-
-    result = _stitch_sequential(unique)
-    result = _crop_black(result)
-    logger.info(f"Stitch complete — output shape: {result.shape}")
-    return result, "ok"
-
-
-def _stitch_grid(
-    frames: List[np.ndarray], rows: int, cols: int,
-) -> Tuple[Optional[np.ndarray], str]:
-    """
-    Stitch frames captured in column-major boustrophedon order into a panorama.
-
-    1. Rearrange into a row-major grid (grid[row][col]).
-    2. Stitch each row left-to-right using pair-wise stitching.
-    3. Vertically concatenate all row strips.
-    """
-    logger.info(f"Grid stitch: {rows}r × {cols}c = {rows * cols} frames")
-
-    # Build grid[row][col] from column-major boustrophedon order
-    grid: List[List[np.ndarray]] = [[None] * cols for _ in range(rows)]
-    idx = 0
-    for col in range(cols):
-        row_range = range(rows) if col % 2 == 0 else range(rows - 1, -1, -1)
-        for row in row_range:
-            grid[row][col] = frames[idx]
-            idx += 1
-
-    # Stitch each row independently
-    row_strips = []
-    for r in range(rows):
-        row_frames = [f for f in grid[r] if f is not None]
-        if not row_frames:
-            continue
-        logger.info(f"  Stitching row {r + 1}/{rows} ({len(row_frames)} frames)")
-        strip = _stitch_sequential(row_frames, label=f"row{r + 1}: ")
-        row_strips.append(strip)
-        gc.collect()
-
-    if not row_strips:
-        return None, "grid_empty"
-
-    if len(row_strips) == 1:
-        result = row_strips[0]
+    scale = min(1.0, 600.0 / max(h_a, w_a, h_b, w_b))
+    if scale < 1.0:
+        a = cv2.resize(frame_a, None, fx=scale, fy=scale)
+        b = cv2.resize(frame_b, None, fx=scale, fy=scale)
     else:
-        # Vertically concatenate rows (resize to common width)
-        result = _vconcat_strips(row_strips)
+        a, b = frame_a, frame_b
 
-    result = _crop_black(result)
-    logger.info(f"Grid stitch complete — output shape: {result.shape}")
-    return result, "ok_grid"
+    gray_a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+    gray_b = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
+    sh_a, sw_a = gray_a.shape
+    sh_b, sw_b = gray_b.shape
 
+    # Use a generous center crop of B as the template (40% of each dimension)
+    crop_h = max(32, int(sh_b * 0.4))
+    crop_w = max(32, int(sw_b * 0.4))
+    y0 = (sh_b - crop_h) // 2
+    x0 = (sw_b - crop_w) // 2
+    template = gray_b[y0:y0 + crop_h, x0:x0 + crop_w]
 
-def _find_vertical_overlap(a: np.ndarray, b: np.ndarray, max_overlap: float = 0.75) -> int:
-    """
-    Find vertical overlap between two strips using template matching.
-    Searches the bottom portion of `a` for the top edge strip of `b`.
-    Returns the overlap in pixels (0 if none found).
-    """
-    ha, wa = a.shape[:2]
-    hb, wb = b.shape[:2]
-    w = min(wa, wb)
+    if template.shape[0] > gray_a.shape[0] or template.shape[1] > gray_a.shape[1]:
+        return None
 
-    scale = min(1.0, 400.0 / w)
-    sw = int(w * scale)
-    sha = int(ha * scale)
-    shb = int(hb * scale)
-    if sw < 16 or sha < 16 or shb < 16:
-        return 0
-
-    ga = cv2.cvtColor(cv2.resize(a[:, :w], (sw, sha)), cv2.COLOR_BGR2GRAY)
-    gb = cv2.cvtColor(cv2.resize(b[:, :w], (sw, shb)), cv2.COLOR_BGR2GRAY)
-
-    # Template: top strip of b (15% of its height)
-    strip_h = max(8, int(shb * 0.15))
-    template = gb[:strip_h, :]
-
-    # Search region: bottom portion of a
-    search_h = int(sha * max_overlap)
-    search_region = ga[sha - search_h:, :]
-
-    if search_region.shape[0] < template.shape[0]:
-        return 0
-
-    res = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+    res = cv2.matchTemplate(gray_a, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
-    if max_val < 0.3:
-        return 0
+    if max_val < 0.25:
+        return None
 
-    overlap_scaled = search_h - max_loc[1]
-    overlap = int(overlap_scaled / scale)
-    return max(0, min(overlap, int(ha * max_overlap)))
+    # max_loc is where the template's top-left was found in A.
+    # The template was taken from (x0, y0) in B.
+    # So B's origin in A's coordinate space is at (max_loc[0] - x0, max_loc[1] - y0).
+    dx = (max_loc[0] - x0) / scale
+    dy = (max_loc[1] - y0) / scale
 
-
-def _blend_vertical(a: np.ndarray, b: np.ndarray, overlap: int) -> np.ndarray:
-    """Merge two strips with a linear blend across the vertical overlap zone."""
-    ha, wa = a.shape[:2]
-    hb, wb = b.shape[:2]
-    w = min(wa, wb)
-    a = a[:, :w]
-    b = b[:, :w]
-
-    out_h = ha + hb - overlap
-    result = np.zeros((out_h, w, 3), dtype=np.uint8)
-
-    result[:ha - overlap] = a[:ha - overlap]
-    result[ha:] = b[overlap:]
-
-    if overlap > 0:
-        alpha = np.linspace(1, 0, overlap, dtype=np.float32).reshape(-1, 1, 1)
-        region_a = a[ha - overlap:].astype(np.float32)
-        region_b = b[:overlap].astype(np.float32)
-        result[ha - overlap:ha] = (region_a * alpha + region_b * (1 - alpha)).astype(np.uint8)
-
-    return result
+    logger.debug(f"Template offset: dx={dx:.1f}  dy={dy:.1f}  confidence={max_val:.3f}")
+    return (dx, dy)
 
 
-def _vconcat_strips(strips: List[np.ndarray]) -> np.ndarray:
-    """Resize strips to the same width, then vertically concatenate with overlap blending."""
-    target_w = max(s.shape[1] for s in strips)
-    resized = []
-    for s in strips:
-        h, w = s.shape[:2]
-        if w != target_w:
-            new_h = int(h * target_w / w)
-            s = cv2.resize(s, (target_w, new_h))
-        resized.append(s)
-
-    result = resized[0]
-    for i, strip in enumerate(resized[1:], 1):
-        overlap = _find_vertical_overlap(result, strip)
-        if overlap > 0:
-            logger.info(f"  Row {i+1}: found {overlap}px vertical overlap, blending")
-            result = _blend_vertical(result, strip, overlap)
-        else:
-            result = np.vstack([result, strip])
-    return result
-
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
 
 def _deduplicate(frames: List[np.ndarray], threshold: float = 0.97) -> List[np.ndarray]:
-    """Remove near-duplicate frames based on histogram correlation."""
+    """Remove near-duplicate consecutive frames based on histogram correlation."""
     if len(frames) <= 2:
         return frames
     unique = [frames[0]]
@@ -373,15 +206,187 @@ def _hist(frame: np.ndarray) -> np.ndarray:
     return cv2.calcHist([gray], [0], None, [64], [0, 256])
 
 
+# ---------------------------------------------------------------------------
+# Canvas compositing with linear blending
+# ---------------------------------------------------------------------------
+
+def _composite(
+    frames: List[np.ndarray],
+    positions: List[Tuple[float, float]],
+) -> np.ndarray:
+    """
+    Place every frame at its absolute (x, y) position on a single canvas.
+    Where frames overlap, use distance-based alpha blending so seams are
+    invisible.
+    """
+    # Compute canvas bounds
+    xs, ys = [], []
+    for (x, y), frame in zip(positions, frames):
+        h, w = frame.shape[:2]
+        xs.extend([x, x + w])
+        ys.extend([y, y + h])
+
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    canvas_w = int(np.ceil(max_x - min_x))
+    canvas_h = int(np.ceil(max_y - min_y))
+
+    logger.info(f"Canvas size: {canvas_w} × {canvas_h}")
+
+    # Accumulate weighted colour and weight for linear blending
+    # Use float32 for accumulation
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float64)
+    weight = np.zeros((canvas_h, canvas_w), dtype=np.float64)
+
+    for (x, y), frame in zip(positions, frames):
+        h, w = frame.shape[:2]
+        ox = int(round(x - min_x))
+        oy = int(round(y - min_y))
+
+        # Clamp to canvas (shouldn't be needed, but safety)
+        pw = min(w, canvas_w - ox)
+        ph = min(h, canvas_h - oy)
+        if pw <= 0 or ph <= 0:
+            continue
+
+        # Per-pixel weight: ramp from edges so overlapping regions blend smoothly
+        # Weight = min(distance from each edge) — higher in the centre
+        ramp_x = np.minimum(
+            np.arange(pw, dtype=np.float64),
+            np.arange(pw, 0, -1, dtype=np.float64),
+        ) + 1.0
+        ramp_y = np.minimum(
+            np.arange(ph, dtype=np.float64),
+            np.arange(ph, 0, -1, dtype=np.float64),
+        ) + 1.0
+        w_map = ramp_y[:, None] * ramp_x[None, :]  # (ph, pw)
+
+        roi = frame[:ph, :pw].astype(np.float64)
+        canvas[oy:oy + ph, ox:ox + pw] += roi * w_map[:, :, None]
+        weight[oy:oy + ph, ox:ox + pw] += w_map
+
+    # Normalise
+    mask = weight > 0
+    for c in range(3):
+        canvas[:, :, c][mask] /= weight[mask]
+
+    return canvas.astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def stitch_frames(
+    frames: List[np.ndarray],
+    grid_shape: Optional[Tuple[int, int]] = None,
+) -> Tuple[Optional[np.ndarray], str]:
+    """
+    Stitch a sequence of overlapping frames into a single panorama.
+
+    Algorithm:
+      1. Deduplicate near-identical consecutive frames.
+      2. Enhance each frame (CLAHE + gamma) for feature detection.
+      3. Compute pairwise translation offsets between consecutive enhanced
+         frames using ORB feature matching (with template-match fallback).
+      4. Accumulate absolute positions.
+      5. Composite *original* (un-enhanced) frames onto one canvas with
+         distance-weighted blending.
+
+    grid_shape is accepted for API compatibility but ignored — sequential
+    registration handles any scan pattern.
+
+    Returns (panorama_image, status_string).
+    """
+    if not frames:
+        return None, "no_frames"
+
+    if len(frames) == 1:
+        return frames[0], "single_frame"
+
+    # Step 1: deduplicate
+    unique = _deduplicate(frames)
+    n = len(unique)
+    logger.info(f"Stitching {n} unique frames (from {len(frames)} captured)")
+
+    if n == 1:
+        return unique[0], "single_frame"
+
+    # Step 2: enhance for feature detection
+    logger.info("Enhancing frames for feature detection…")
+    enhanced = [enhance_frame(f) for f in unique]
+
+    # Step 3: compute pairwise offsets
+    logger.info("Computing pairwise offsets…")
+    positions: List[Tuple[float, float]] = [(0.0, 0.0)]
+    failed_pairs = 0
+
+    for i in range(len(enhanced) - 1):
+        offset = _estimate_offset(enhanced[i], enhanced[i + 1])
+
+        if offset is None:
+            # Fallback: template matching on enhanced frames
+            offset = _template_offset(enhanced[i], enhanced[i + 1])
+
+        if offset is None:
+            # Last resort: try on originals
+            offset = _estimate_offset(unique[i], unique[i + 1])
+
+        if offset is None:
+            offset = _template_offset(unique[i], unique[i + 1])
+
+        if offset is None:
+            # Cannot determine offset — place to the right with slight overlap
+            h, w = unique[i + 1].shape[:2]
+            prev_w = unique[i].shape[1]
+            overlap_guess = int(prev_w * 0.15)
+            offset = (prev_w - overlap_guess, 0)
+            failed_pairs += 1
+            logger.warning(
+                f"  Pair {i}→{i+1}: all matching failed, guessing horizontal placement"
+            )
+
+        dx, dy = offset
+        prev_x, prev_y = positions[-1]
+        positions.append((prev_x + dx, prev_y + dy))
+
+        if (i + 1) % 10 == 0 or i == len(enhanced) - 2:
+            logger.info(f"  Offset {i+1}/{len(enhanced)-1} done")
+
+        gc.collect()
+
+    # Free enhanced frames — we only need originals for compositing
+    del enhanced
+    gc.collect()
+
+    if failed_pairs > 0:
+        logger.warning(f"{failed_pairs}/{n-1} pairs used fallback placement")
+
+    # Step 4: composite originals onto canvas
+    logger.info("Compositing panorama…")
+    panorama = _composite(unique, positions)
+
+    # Step 5: crop any black border
+    panorama = _crop_black(panorama)
+
+    logger.info(f"Stitch complete — output shape: {panorama.shape}")
+    status = "ok" if failed_pairs == 0 else f"ok_with_{failed_pairs}_fallbacks"
+    return panorama, status
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
 def _crop_black(img: np.ndarray) -> np.ndarray:
-    """Crop black borders from stitched panorama."""
+    """Crop black borders that may appear from canvas compositing."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return img
     x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
-    return img[y: y + h, x: x + w]
+    return img[y:y + h, x:x + w]
 
 
 def to_base64(frame: np.ndarray, quality: int = 85) -> str:
