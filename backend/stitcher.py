@@ -31,7 +31,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 10   # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
-BATCH_OVERLAP = 2  # frames shared between adjacent batches for second-level stitch anchoring
+BATCH_OVERLAP = 3  # frames shared between adjacent batches for second-level stitch anchoring
 
 
 def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
@@ -202,7 +202,7 @@ def _stitch_strips(strips: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]
 
     # Try stitching all strips at once if within batch size
     if len(strips) <= BATCH_SIZE:
-        final, status = _stitch_batch(strips)
+        final, status = _stitch_batch(strips, try_panorama_mode=True)
         if final is not None:
             return final, "ok_grid"
         logger.warning("All-at-once strip stitch failed — trying tree reduction")
@@ -222,7 +222,9 @@ def _stitch_strips(strips: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]
                 f"Tree stitch level {tree_level}, pair {j // 2 + 1}/"
                 f"{math.ceil(len(level) / 2)}…"
             )
-            merged, _ = _stitch_batch([level[j], level[j + 1]])
+            merged, _ = _stitch_batch(
+                [level[j], level[j + 1]], try_panorama_mode=True,
+            )
             if merged is not None:
                 next_level.append(merged)
             else:
@@ -304,8 +306,16 @@ def _stitch_sequential(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], 
     return _stitch_strips(batch_panoramas)
 
 
-def _stitch_batch(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
-    """Stitch a small batch of pre-enhanced frames using OpenCV stitcher."""
+def _stitch_batch(
+    frames: List[np.ndarray],
+    try_panorama_mode: bool = False,
+) -> Tuple[Optional[np.ndarray], str]:
+    """Stitch a small batch of pre-enhanced frames using OpenCV stitcher.
+
+    When *try_panorama_mode* is True, a failed SCANS-mode attempt is retried
+    with PANORAMA mode at a lower confidence threshold.  This helps when
+    merging already-stitched batch panoramas whose perspectives diverge.
+    """
     if len(frames) == 1:
         return frames[0], "single_frame"
 
@@ -318,6 +328,20 @@ def _stitch_batch(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
         return pano, "ok"
 
     logger.warning(f"Batch stitch failed (status={status})")
+
+    if try_panorama_mode:
+        # Retry with PANORAMA mode + lower confidence — better for images
+        # captured from different PTZ positions with varying perspectives.
+        logger.info("Retrying with PANORAMA mode (confidence=0.3)…")
+        stitcher2 = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+        stitcher2.setPanoConfidenceThresh(0.3)
+        status2, pano2 = stitcher2.stitch(frames)
+        if status2 == cv2.Stitcher_OK:
+            pano2 = _crop_black(pano2)
+            logger.info(f"PANORAMA-mode stitch OK — shape {pano2.shape}")
+            return pano2, "ok_panorama"
+        logger.warning(f"PANORAMA-mode stitch also failed (status={status2})")
+
     return None, f"failed_{status}"
 
 
