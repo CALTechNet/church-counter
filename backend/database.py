@@ -42,6 +42,35 @@ def init_db():
             updated_at TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def get_config(key: str, default=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM config WHERE key = ?", (key,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return default
+    return json.loads(row[0])
+
+
+def set_config(key: str, value):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?, ?, ?)",
+        (key, json.dumps(value), datetime.now().isoformat()),
+    )
     conn.commit()
     conn.close()
 
