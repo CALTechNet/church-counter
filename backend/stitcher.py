@@ -68,13 +68,89 @@ def _stitch_pair(a: np.ndarray, b: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
+def _find_horizontal_overlap(a: np.ndarray, b: np.ndarray, max_overlap: float = 0.75) -> int:
+    """
+    Find horizontal overlap between two frames using template matching.
+    Searches the right portion of `a` for the left edge strip of `b`.
+    Returns the overlap in pixels (0 if none found).
+    """
+    ha, wa = a.shape[:2]
+    hb, wb = b.shape[:2]
+    h = min(ha, hb)
+
+    # Downscale for speed
+    scale = min(1.0, 400.0 / h)
+    sh = int(h * scale)
+    swa = int(wa * scale)
+    swb = int(wb * scale)
+    if sh < 16 or swa < 16 or swb < 16:
+        return 0
+
+    ga = cv2.cvtColor(cv2.resize(a[:h], (swa, sh)), cv2.COLOR_BGR2GRAY)
+    gb = cv2.cvtColor(cv2.resize(b[:h], (swb, sh)), cv2.COLOR_BGR2GRAY)
+
+    # Template: left strip of b (15% of its width)
+    strip_w = max(8, int(swb * 0.15))
+    template = gb[:, :strip_w]
+
+    # Search region: right portion of a (up to max_overlap of a's width)
+    search_w = int(swa * max_overlap)
+    search_region = ga[:, swa - search_w:]
+
+    if search_region.shape[1] < template.shape[1]:
+        return 0
+
+    res = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+    if max_val < 0.3:
+        return 0
+
+    # Overlap = distance from match position to right edge of search region
+    overlap_scaled = search_w - max_loc[0]
+    overlap = int(overlap_scaled / scale)
+    return max(0, min(overlap, int(wa * max_overlap)))
+
+
+def _blend_horizontal(a: np.ndarray, b: np.ndarray, overlap: int) -> np.ndarray:
+    """Merge two frames with a linear blend across the overlap zone."""
+    ha, wa = a.shape[:2]
+    hb, wb = b.shape[:2]
+    h = min(ha, hb)
+    a = a[:h]
+    b = b[:h]
+
+    out_w = wa + wb - overlap
+    result = np.zeros((h, out_w, 3), dtype=np.uint8)
+
+    # Left part (non-overlapping portion of a)
+    result[:, :wa - overlap] = a[:, :wa - overlap]
+    # Right part (non-overlapping portion of b)
+    result[:, wa:] = b[:, overlap:]
+
+    # Blend the overlap region
+    if overlap > 0:
+        alpha = np.linspace(1, 0, overlap, dtype=np.float32).reshape(1, -1, 1)
+        region_a = a[:, wa - overlap:].astype(np.float32)
+        region_b = b[:, :overlap].astype(np.float32)
+        result[:, wa - overlap:wa] = (region_a * alpha + region_b * (1 - alpha)).astype(np.uint8)
+
+    return result
+
+
 def _hconcat_pair(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Resize two frames to the same height, then horizontally concatenate."""
+    """Join two frames, detecting and blending any horizontal overlap."""
     target_h = min(a.shape[0], b.shape[0])
     ha, wa = a.shape[:2]
     hb, wb = b.shape[:2]
     ra = cv2.resize(a, (int(wa * target_h / ha), target_h))
     rb = cv2.resize(b, (int(wb * target_h / hb), target_h))
+
+    overlap = _find_horizontal_overlap(ra, rb)
+    if overlap > 0:
+        logger.info(f"    Found {overlap}px horizontal overlap, blending")
+        return _blend_horizontal(ra, rb, overlap)
+
     return np.hstack([ra, rb])
 
 
@@ -190,8 +266,73 @@ def _stitch_grid(
     return result, "ok_grid"
 
 
+def _find_vertical_overlap(a: np.ndarray, b: np.ndarray, max_overlap: float = 0.75) -> int:
+    """
+    Find vertical overlap between two strips using template matching.
+    Searches the bottom portion of `a` for the top edge strip of `b`.
+    Returns the overlap in pixels (0 if none found).
+    """
+    ha, wa = a.shape[:2]
+    hb, wb = b.shape[:2]
+    w = min(wa, wb)
+
+    scale = min(1.0, 400.0 / w)
+    sw = int(w * scale)
+    sha = int(ha * scale)
+    shb = int(hb * scale)
+    if sw < 16 or sha < 16 or shb < 16:
+        return 0
+
+    ga = cv2.cvtColor(cv2.resize(a[:, :w], (sw, sha)), cv2.COLOR_BGR2GRAY)
+    gb = cv2.cvtColor(cv2.resize(b[:, :w], (sw, shb)), cv2.COLOR_BGR2GRAY)
+
+    # Template: top strip of b (15% of its height)
+    strip_h = max(8, int(shb * 0.15))
+    template = gb[:strip_h, :]
+
+    # Search region: bottom portion of a
+    search_h = int(sha * max_overlap)
+    search_region = ga[sha - search_h:, :]
+
+    if search_region.shape[0] < template.shape[0]:
+        return 0
+
+    res = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+    if max_val < 0.3:
+        return 0
+
+    overlap_scaled = search_h - max_loc[1]
+    overlap = int(overlap_scaled / scale)
+    return max(0, min(overlap, int(ha * max_overlap)))
+
+
+def _blend_vertical(a: np.ndarray, b: np.ndarray, overlap: int) -> np.ndarray:
+    """Merge two strips with a linear blend across the vertical overlap zone."""
+    ha, wa = a.shape[:2]
+    hb, wb = b.shape[:2]
+    w = min(wa, wb)
+    a = a[:, :w]
+    b = b[:, :w]
+
+    out_h = ha + hb - overlap
+    result = np.zeros((out_h, w, 3), dtype=np.uint8)
+
+    result[:ha - overlap] = a[:ha - overlap]
+    result[ha:] = b[overlap:]
+
+    if overlap > 0:
+        alpha = np.linspace(1, 0, overlap, dtype=np.float32).reshape(-1, 1, 1)
+        region_a = a[ha - overlap:].astype(np.float32)
+        region_b = b[:overlap].astype(np.float32)
+        result[ha - overlap:ha] = (region_a * alpha + region_b * (1 - alpha)).astype(np.uint8)
+
+    return result
+
+
 def _vconcat_strips(strips: List[np.ndarray]) -> np.ndarray:
-    """Resize strips to the same width, then vertically concatenate."""
+    """Resize strips to the same width, then vertically concatenate with overlap blending."""
     target_w = max(s.shape[1] for s in strips)
     resized = []
     for s in strips:
@@ -200,7 +341,16 @@ def _vconcat_strips(strips: List[np.ndarray]) -> np.ndarray:
             new_h = int(h * target_w / w)
             s = cv2.resize(s, (target_w, new_h))
         resized.append(s)
-    return np.vstack(resized)
+
+    result = resized[0]
+    for i, strip in enumerate(resized[1:], 1):
+        overlap = _find_vertical_overlap(result, strip)
+        if overlap > 0:
+            logger.info(f"  Row {i+1}: found {overlap}px vertical overlap, blending")
+            result = _blend_vertical(result, strip, overlap)
+        else:
+            result = np.vstack([result, strip])
+    return result
 
 
 def _deduplicate(frames: List[np.ndarray], threshold: float = 0.97) -> List[np.ndarray]:
