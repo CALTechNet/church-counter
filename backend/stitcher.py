@@ -266,54 +266,36 @@ def _vconcat_fallback(frames: List[np.ndarray]) -> np.ndarray:
 
 def _stitch_sequential(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     """
-    Legacy sequential stitching for preset scans (no grid info).
-    Uses coverage-based batching with overlap.
+    Sequential stitching for preset scans (no grid info).
+    Deduplicates, enhances, then stitches all frames at once with PANORAMA mode.
     """
     # Deduplicate near-identical frames
     unique = _deduplicate(frames)
     logger.info(f"Stitching {len(unique)} unique frames (from {len(frames)} captured)")
 
     with ThreadPoolExecutor() as pool:
-        unique = list(pool.map(_enhance_for_stitching, unique))
-    logger.info(f"Enhanced {len(unique)} frames on raw data")
+        enhanced = list(pool.map(_enhance_for_stitching, unique))
+    logger.info(f"Enhanced {len(enhanced)} frames on raw data")
 
-    if len(unique) <= BATCH_SIZE:
-        return _stitch_batch(unique)
+    # Try stitching all enhanced frames at once with PANORAMA mode
+    stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+    status, pano = stitcher.stitch(enhanced)
+    if status == cv2.Stitcher_OK:
+        pano = _crop_black(pano)
+        logger.info(f"Stitch OK (enhanced) — output shape: {pano.shape}")
+        return pano, "ok"
 
-    frame_groups = _group_indices_by_coverage(unique, batch_size=BATCH_SIZE, overlap=BATCH_OVERLAP)
-    n_batches = len(frame_groups)
-    logger.info(
-        f"Stitching in {n_batches} coverage-based batches "
-        f"(sizes: {[len(g) for g in frame_groups]})"
-    )
+    logger.warning(f"Enhanced stitch failed (status={status}), trying original frames…")
 
-    compressed = [cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
-                  for f in unique]
-    del unique
-    gc.collect()
+    # Retry with original (unenhanced) unique frames
+    status2, pano2 = stitcher.stitch(unique)
+    if status2 == cv2.Stitcher_OK:
+        pano2 = _crop_black(pano2)
+        logger.info(f"Stitch OK (original) — output shape: {pano2.shape}")
+        return pano2, "ok_original"
 
-    batch_panoramas: List[np.ndarray] = []
-    for batch_num, indices in enumerate(frame_groups, 1):
-        batch = [cv2.imdecode(np.frombuffer(compressed[i], np.uint8), cv2.IMREAD_COLOR)
-                 for i in indices]
-        logger.info(f"Stitching batch {batch_num}/{n_batches} ({len(batch)} frames)…")
-        pano, _status = _stitch_batch(batch)
-        if pano is not None:
-            batch_panoramas.append(pano)
-        else:
-            logger.warning(f"Batch {batch_num} stitch failed — using concat fallback")
-            batch_panoramas.append(_concat_fallback(batch))
-        del batch
-        gc.collect()
-    del compressed
-    gc.collect()
-
-    if len(batch_panoramas) == 1:
-        return batch_panoramas[0], "ok"
-
-    # Stitch batch panoramas together
-    logger.info(f"Stitching {len(batch_panoramas)} batch panoramas together…")
-    return _stitch_strips(batch_panoramas)
+    logger.warning("Both stitch attempts failed, using fallback concat")
+    return _concat_fallback(unique), "fallback_concat"
 
 
 def _stitch_batch(
