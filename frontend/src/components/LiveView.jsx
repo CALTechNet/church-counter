@@ -44,7 +44,7 @@ export default function LiveView({ scanning, ptzPos }) {
       } catch (e) {
         if (running) setError(e.message)
       }
-      if (running) setTimeout(fetchFrame, 300)
+      if (running) setTimeout(fetchFrame, 100)
     }
 
     fetchFrame()
@@ -56,6 +56,35 @@ export default function LiveView({ scanning, ptzPos }) {
     ptzCommand('stop').catch(() => {})
     ptzCommand('zoomstop').catch(() => {})
   }
+
+  // Arrow key PTZ control (slow speed for precision)
+  useEffect(() => {
+    const pressed = new Set()
+    const KEY_ACTION = {
+      ArrowUp:    'up',
+      ArrowDown:  'down',
+      ArrowLeft:  'left',
+      ArrowRight: 'right',
+    }
+    const onKeyDown = (e) => {
+      const action = KEY_ACTION[e.key]
+      if (!action || pressed.has(e.key)) return
+      e.preventDefault()
+      pressed.add(e.key)
+      sendPtz(action, 3)
+    }
+    const onKeyUp = (e) => {
+      if (!KEY_ACTION[e.key]) return
+      pressed.delete(e.key)
+      if (pressed.size === 0) ptzCommand('stop').catch(() => {})
+    }
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+    }
+  }, [])
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: isMobile ? 'column' : 'row', overflow: 'hidden', background: C.bg }}>
