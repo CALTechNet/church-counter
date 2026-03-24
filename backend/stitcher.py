@@ -28,7 +28,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 6  # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
+BATCH_SIZE = 10  # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
 
 
 def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
