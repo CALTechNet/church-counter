@@ -12,6 +12,12 @@ Batching fix: frames are split into small batches before stitching
 to prevent OpenCV's bundle adjuster from consuming excessive memory
 and crashing the machine.
 
+Coverage fix: batch boundaries are chosen at natural transitions in the
+scan (where histogram correlation between consecutive frames drops,
+indicating the camera moved to a new area) rather than at fixed offsets.
+Adjacent batches share BATCH_OVERLAP frames so the second-level stitch
+always has visual anchors between batches, preventing coverage gaps.
+
 Memory fix: waiting frames are JPEG-compressed in memory (~600 KB each
 vs ~6 MB raw) so 76 frames occupy ~45 MB instead of ~456 MB while
 batches are processed. Enhancement runs on the raw frames before
@@ -30,7 +36,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 10  # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
+BATCH_SIZE = 10   # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
+BATCH_OVERLAP = 2  # frames shared between adjacent batches for second-level stitch anchoring
 
 
 def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
@@ -76,24 +83,29 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     if len(unique) <= BATCH_SIZE:
         return _stitch_batch(unique)
 
-    # JPEG-compress enhanced frames so 76×~6 MB → 76×~600 KB in memory.
+    # Group frames by scan coverage before compressing: split at natural
+    # transitions (low inter-frame similarity) so each batch contains frames
+    # that actually overlap each other.  Adjacent batches share BATCH_OVERLAP
+    # frames as visual anchors for the second-level stitch.
+    frame_groups = _group_indices_by_coverage(unique, batch_size=BATCH_SIZE, overlap=BATCH_OVERLAP)
+    n_batches = len(frame_groups)
+    logger.info(
+        f"Stitching in {n_batches} coverage-based batches "
+        f"(sizes: {[len(g) for g in frame_groups]})"
+    )
+
+    # JPEG-compress all enhanced frames so 76×~6 MB → 76×~600 KB in memory.
     # Only the active batch is decompressed to full-res arrays; no
     # re-enhancement is needed after decoding.
-    n_batches = math.ceil(len(unique) / BATCH_SIZE)
-    logger.info(f"Stitching in {n_batches} batches of up to {BATCH_SIZE} frames")
     compressed = [cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
                   for f in unique]
     del unique
     gc.collect()
 
     batch_panoramas: List[np.ndarray] = []
-    batch_num = 0
-    while compressed:
-        batch_compressed, compressed = compressed[:BATCH_SIZE], compressed[BATCH_SIZE:]
-        batch = [cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
-                 for b in batch_compressed]
-        del batch_compressed
-        batch_num += 1
+    for batch_num, indices in enumerate(frame_groups, 1):
+        batch = [cv2.imdecode(np.frombuffer(compressed[i], np.uint8), cv2.IMREAD_COLOR)
+                 for i in indices]
         logger.info(f"Stitching batch {batch_num}/{n_batches} ({len(batch)} frames)…")
         pano, _status = _stitch_batch(batch)
         if pano is not None:
@@ -103,6 +115,8 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
             batch_panoramas.append(_concat_fallback(batch))
         del batch
         gc.collect()
+    del compressed
+    gc.collect()
 
     if len(batch_panoramas) == 1:
         return batch_panoramas[0], "ok"
@@ -166,6 +180,58 @@ def _concat_fallback(frames: List[np.ndarray]) -> np.ndarray:
         new_w = int(w * target_h / h)
         resized.append(cv2.resize(f, (new_w, target_h)))
     return np.hstack(resized)
+
+
+def _group_indices_by_coverage(
+    frames: List[np.ndarray],
+    batch_size: int = BATCH_SIZE,
+    overlap: int = BATCH_OVERLAP,
+) -> List[List[int]]:
+    """
+    Return a list of index-lists grouping frames by scan coverage.
+
+    Batch boundaries are placed at natural transitions — positions where
+    histogram correlation between consecutive frames drops well below the
+    run's average (the camera moved to a new part of the room) — rather
+    than at fixed offsets.  A hard cap at ``batch_size`` prevents any single
+    batch from overwhelming the bundle adjuster.
+
+    Adjacent batches share ``overlap`` frame indices so the second-level
+    stitch always has shared visual context between batches, preventing
+    coverage gaps at batch boundaries.
+    """
+    n = len(frames)
+    if n <= batch_size:
+        return [list(range(n))]
+
+    hists = [_hist(f) for f in frames]
+    pair_scores = [
+        cv2.compareHist(hists[i], hists[i + 1], cv2.HISTCMP_CORREL)
+        for i in range(n - 1)
+    ]
+    mean_score = sum(pair_scores) / len(pair_scores) if pair_scores else 1.0
+    # A score below 40 % of the run average signals a meaningful coverage jump
+    break_threshold = mean_score * 0.40
+
+    groups: List[List[int]] = []
+    start = 0
+    for i in range(1, n):
+        batch_len = i - start
+        at_capacity = batch_len >= batch_size
+        natural_break = (
+            batch_len >= batch_size // 2
+            and pair_scores[i - 1] < break_threshold
+        )
+        if at_capacity or natural_break:
+            groups.append(list(range(start, i)))
+            # Next batch starts `overlap` frames back so both batches share
+            # those frames as visual anchors during the second-level stitch.
+            start = max(i - overlap, start + 1)
+
+    if start < n:
+        groups.append(list(range(start, n)))
+
+    return groups
 
 
 def _deduplicate(frames: List[np.ndarray], threshold: float = 0.97) -> List[np.ndarray]:
