@@ -394,6 +394,7 @@ class RoomConfig(BaseModel):
     scan_mode:      Optional[str] = None   # "preset" | "calibrated"
     preset_start:   Optional[int] = None
     preset_end:     Optional[int] = None
+    preset_cols:    Optional[int] = None
     rtsp_url:       Optional[str] = None
 
 
@@ -405,6 +406,7 @@ class AppSettings(BaseModel):
     scan_mode:      Optional[str]  = None   # "preset" | "calibrated"
     preset_start:   Optional[int]  = None
     preset_end:     Optional[int]  = None
+    preset_cols:    Optional[int]  = None
     scan_positions: Optional[int]  = None
     rooms:          Optional[list] = None
 

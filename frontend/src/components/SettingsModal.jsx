@@ -32,6 +32,7 @@ function defaultRoom() {
     scan_mode: 'preset',
     preset_start: 100,
     preset_end: 131,
+    preset_cols: null,
     rtsp_url: '',
   }
 }
@@ -61,6 +62,7 @@ export default function SettingsModal({ onClose, onSave }) {
               scan_mode: s.scan_mode || 'preset',
               preset_start: s.preset_start ?? 100,
               preset_end: s.preset_end ?? 131,
+              preset_cols: s.preset_cols ?? null,
               rtsp_url: '',
             }]
         setCfg({ church_name: s.church_name || 'Lakeshore Church', rooms })
@@ -117,6 +119,7 @@ export default function SettingsModal({ onClose, onSave }) {
         payload.scan_mode = firstRoom.scan_mode
         payload.preset_start = firstRoom.preset_start
         payload.preset_end = firstRoom.preset_end
+        payload.preset_cols = firstRoom.preset_cols
       }
       await saveSettings(payload)
       setMsg({ text: 'Settings saved!', ok: true })
@@ -296,8 +299,17 @@ export default function SettingsModal({ onClose, onSave }) {
                                   onChange={e => updateRoom(room.id, 'preset_end', parseInt(e.target.value) || 0)} />
                               </div>
                             </div>
+                            <div style={{ marginTop: 10 }}>
+                              <label style={label}>Grid Columns</label>
+                              <input type="number" style={inputStyle} value={room.preset_cols ?? ''} min={1} max={32}
+                                placeholder="Auto"
+                                onChange={e => updateRoom(room.id, 'preset_cols', e.target.value ? parseInt(e.target.value) || null : null)} />
+                              <p style={{ margin: '4px 0 0', fontSize: 10, color: C.muted }}>
+                                Number of columns in the preset grid (boustrophedon scan pattern). Set this to enable grid-aware stitching.
+                              </p>
+                            </div>
                             <p style={{ margin: '8px 0 0', fontSize: 11, color: C.muted }}>
-                              Total: {presetCount} preset{presetCount !== 1 ? 's' : ''}
+                              Total: {presetCount} preset{presetCount !== 1 ? 's' : ''}{room.preset_cols > 0 ? ` (${Math.ceil(presetCount / room.preset_cols)} rows × ${room.preset_cols} cols)` : ''}
                             </p>
                           </div>
                         )}
