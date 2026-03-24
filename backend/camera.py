@@ -11,7 +11,7 @@ import math
 import socket
 import threading
 import time
-from typing import List, Optional, Callable, Awaitable
+from typing import List, Optional, Callable, Awaitable, Tuple
 
 import cv2
 import numpy as np
@@ -616,14 +616,17 @@ async def _calibrated_scan(
     await prog("Returning camera to home…", 90)
     await go_home()
     await prog(f"Capture complete — {len(frames)} frames", 92)
-    logger.info(f"_calibrated_scan done: {len(frames)} frames across {total} positions")
-    return frames
+    logger.info(f"_calibrated_scan done: {len(frames)} frames across {total} positions ({rows}r × {cols}c grid)")
+    return frames, (rows, cols)
 
 
-async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event=None, room_config: dict = None) -> List[np.ndarray]:
+async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event=None, room_config: dict = None) -> Tuple[List[np.ndarray], Optional[Tuple[int, int]]]:
     """
     Dispatch to either preset or calibrated scan based on saved app settings,
     or use room_config if provided to determine camera type and settings.
+
+    Returns (frames, grid_shape) where grid_shape is (rows, cols) for
+    calibrated scans or None for preset/RTSP scans.
     """
     import database as db
 
@@ -636,16 +639,16 @@ async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event
             rtsp_url = room_config.get("rtsp_url", "")
             if not rtsp_url:
                 logger.error("No RTSP URL configured for room")
-                return []
+                return [], None
             if progress_callback:
                 await progress_callback("Capturing RTSP frame…", 10)
             frame = await asyncio.to_thread(capture_frame, rtsp_url)
             if frame is None:
                 logger.error(f"Failed to capture frame from RTSP URL: {rtsp_url}")
-                return []
+                return [], None
             if progress_callback:
                 await progress_callback("Frame captured", 90)
-            return [frame]
+            return [frame], None
 
         # PTZ Optics: use room-specific settings
         mode = room_config.get("scan_mode", "preset")
@@ -659,12 +662,13 @@ async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event
             preset_start = int(room_config.get("preset_start", 100))
             preset_end   = int(room_config.get("preset_end", 131))
             presets = list(range(preset_start, preset_end + 1))
-            return await _preset_scan(
+            frames = await _preset_scan(
                 presets,
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 camera_ip=room_config.get("camera_ip"),
             )
+            return frames, None
 
     # Fallback: use global settings (backward compat)
     settings = db.get_config("app_settings", {})
@@ -676,4 +680,5 @@ async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event
         preset_start = int(settings.get("preset_start", 100))
         preset_end   = int(settings.get("preset_end",   131))
         presets = list(range(preset_start, preset_end + 1))
-        return await _preset_scan(presets, progress_callback=progress_callback, cancel_event=cancel_event)
+        frames = await _preset_scan(presets, progress_callback=progress_callback, cancel_event=cancel_event)
+        return frames, None

@@ -95,7 +95,7 @@ async def run_scan(service_type: str = "Manual", room_id: str = None):
 
         # 1. Capture
         await _progress(f"Scanning {room_name}…", 0)
-        frames = await cam.auto_scan(
+        frames, grid_shape = await cam.auto_scan(
             progress_callback=_progress,
             cancel_event=_scan_cancel,
             room_config=room,
@@ -118,7 +118,7 @@ async def run_scan(service_type: str = "Manual", room_id: str = None):
             logger.info(f"Single frame capture for {room_name} → shape {panorama.shape}")
         else:
             await _progress("Stitching panorama…", 93)
-            panorama, stitch_status = stitch.stitch_frames(frames)
+            panorama, stitch_status = stitch.stitch_frames(frames, grid_shape=grid_shape)
             if panorama is None:
                 raise RuntimeError("Panorama stitching failed")
             logger.info(f"Stitch: {stitch_status} → shape {panorama.shape}")

@@ -3,26 +3,20 @@ Frame stitching for panorama generation.
 Primary: OpenCV Stitcher (RANSAC-based feature matching), batched
 Fallback: Horizontal concat (resized to common height)
 
+Grid-aware stitching: when the camera scan provides grid dimensions
+(rows × cols from a calibrated scan), frames are stitched column-by-column
+first, then the column strips are stitched horizontally.  This matches
+the physical scan pattern (vertical-S / boustrophedon) and is far more
+robust than treating the frames as a flat sequence.
+
+Sequential fallback: for preset scans (no grid info), the legacy
+coverage-based batching is used.
+
 Low-light fix: frames are contrast-enhanced (CLAHE + gamma lift) on the
-raw numpy arrays immediately after deduplication — before any JPEG
-compression — so the stitcher receives the highest-quality enhanced
-input for keypoint detection and alignment.
-
-Batching fix: frames are split into small batches before stitching
-to prevent OpenCV's bundle adjuster from consuming excessive memory
-and crashing the machine.
-
-Coverage fix: batch boundaries are chosen at natural transitions in the
-scan (where histogram correlation between consecutive frames drops,
-indicating the camera moved to a new area) rather than at fixed offsets.
-Adjacent batches share BATCH_OVERLAP frames so the second-level stitch
-always has visual anchors between batches, preventing coverage gaps.
+raw numpy arrays before any JPEG compression.
 
 Memory fix: waiting frames are JPEG-compressed in memory (~600 KB each
-vs ~6 MB raw) so 76 frames occupy ~45 MB instead of ~456 MB while
-batches are processed. Enhancement runs on the raw frames before
-compression, so the JPEG only needs to store the already-enhanced image
-and no re-enhancement is needed after decoding.
+vs ~6 MB raw) while batches are processed.
 """
 import base64
 import gc
@@ -55,11 +49,21 @@ def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
     return cv2.LUT(enhanced, lut)
 
 
-def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
+def stitch_frames(
+    frames: List[np.ndarray],
+    grid_shape: Optional[Tuple[int, int]] = None,
+) -> Tuple[Optional[np.ndarray], str]:
     """
-    Stitch frames into a panorama using batched stitching.
-    Splits frames into batches of BATCH_SIZE, stitches each batch,
-    then stitches the resulting batch panoramas together.
+    Stitch frames into a panorama.
+
+    When *grid_shape* ``(rows, cols)`` is provided (calibrated scan), uses
+    grid-aware stitching: each column is stitched into a vertical strip,
+    then columns are stitched horizontally.  This matches the physical
+    boustrophedon scan pattern and avoids the meta-batch overlap problem.
+
+    Without *grid_shape* (preset scan), falls back to sequential
+    coverage-based batching.
+
     Returns (image, status_message).
     """
     if not frames:
@@ -68,14 +72,176 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     if len(frames) == 1:
         return frames[0], "single_frame"
 
+    if grid_shape is not None:
+        rows, cols = grid_shape
+        if len(frames) == rows * cols:
+            return _stitch_grid(frames, rows, cols)
+        logger.warning(
+            f"Grid expects {rows}×{cols}={rows*cols} frames but got "
+            f"{len(frames)} — falling back to sequential stitch"
+        )
+
+    return _stitch_sequential(frames)
+
+
+# ---------------------------------------------------------------------------
+# Grid-aware stitching (calibrated scan)
+# ---------------------------------------------------------------------------
+
+def _stitch_grid(
+    frames: List[np.ndarray], rows: int, cols: int,
+) -> Tuple[Optional[np.ndarray], str]:
+    """
+    Stitch a grid of frames captured in column-major boustrophedon order.
+
+    Strategy:
+      1. Enhance all frames (CLAHE + gamma).
+      2. Reorganise into columns; un-reverse odd columns so every column
+         runs top→bottom.
+      3. Stitch each column into a vertical strip (≤ BATCH_SIZE frames).
+         If a column has more than BATCH_SIZE frames, batch within the
+         column with overlap.
+      4. Stitch column strips together horizontally, progressively
+         (pair-wise left-to-right) if there are too many for one shot.
+    """
+    logger.info(f"Grid stitch: {rows} rows × {cols} cols = {len(frames)} frames")
+
+    # 1. Enhance on raw numpy arrays
+    with ThreadPoolExecutor() as pool:
+        enhanced = list(pool.map(_enhance_for_stitching, frames))
+    del frames
+    logger.info(f"Enhanced {len(enhanced)} frames on raw data")
+
+    # 2. JPEG-compress for memory efficiency
+    compressed = [
+        cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+        for f in enhanced
+    ]
+    del enhanced
+    gc.collect()
+
+    # 3. Stitch each column into a vertical strip
+    column_strips: List[np.ndarray] = []
+    for col in range(cols):
+        start = col * rows
+        # Decompress this column's frames
+        col_compressed = compressed[start : start + rows]
+        col_frames = [
+            cv2.imdecode(np.frombuffer(c, np.uint8), cv2.IMREAD_COLOR)
+            for c in col_compressed
+        ]
+        # Un-boustrophedon: odd columns were scanned bottom→top, reverse
+        # so every column is top→bottom for consistent spatial ordering.
+        if col % 2 == 1:
+            col_frames = col_frames[::-1]
+
+        logger.info(f"Stitching column {col + 1}/{cols} ({len(col_frames)} frames)…")
+
+        if len(col_frames) == 1:
+            column_strips.append(col_frames[0])
+        elif len(col_frames) <= BATCH_SIZE:
+            pano, _ = _stitch_batch(col_frames)
+            if pano is not None:
+                column_strips.append(pano)
+            else:
+                logger.warning(f"Column {col + 1} stitch failed — vertical concat")
+                column_strips.append(_vconcat_fallback(col_frames))
+        else:
+            # Batch within the column with overlap
+            pano = _stitch_long_column(col_frames)
+            column_strips.append(pano)
+
+        del col_frames
+        gc.collect()
+
+    del compressed
+    gc.collect()
+
+    # 4. Stitch column strips horizontally
+    logger.info(f"Stitching {len(column_strips)} column strips horizontally…")
+    return _stitch_strips(column_strips)
+
+
+def _stitch_long_column(frames: List[np.ndarray]) -> np.ndarray:
+    """Stitch a column that has more frames than BATCH_SIZE by batching with overlap."""
+    n = len(frames)
+    step = BATCH_SIZE - BATCH_OVERLAP
+    parts: List[np.ndarray] = []
+    for i in range(0, n, step):
+        batch = frames[i : i + BATCH_SIZE]
+        if len(batch) == 1:
+            parts.append(batch[0])
+        else:
+            pano, _ = _stitch_batch(batch)
+            parts.append(pano if pano is not None else _vconcat_fallback(batch))
+        gc.collect()
+
+    if len(parts) == 1:
+        return parts[0]
+
+    # Progressively stitch the column parts
+    result = parts[0]
+    for p in parts[1:]:
+        merged, _ = _stitch_batch([result, p])
+        result = merged if merged is not None else _vconcat_fallback([result, p])
+        gc.collect()
+    return result
+
+
+def _stitch_strips(strips: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
+    """
+    Stitch column strips horizontally.  Tries all-at-once first, then
+    falls back to progressive pair-wise stitching (left-to-right).
+    """
+    if len(strips) == 1:
+        return strips[0], "ok_grid"
+
+    # Try stitching all strips at once if within batch size
+    if len(strips) <= BATCH_SIZE:
+        final, status = _stitch_batch(strips)
+        if final is not None:
+            return final, "ok_grid"
+        logger.warning("All-at-once strip stitch failed — trying progressive")
+
+    # Progressive: stitch strips pair-wise left-to-right
+    result = strips[0]
+    for i, strip in enumerate(strips[1:], 1):
+        logger.info(f"Progressive strip stitch {i}/{len(strips) - 1}…")
+        merged, _ = _stitch_batch([result, strip])
+        if merged is not None:
+            result = merged
+        else:
+            logger.warning(f"Progressive stitch failed at strip {i + 1} — horizontal concat")
+            result = _concat_fallback([result, strip])
+        gc.collect()
+
+    return result, "ok_grid_progressive"
+
+
+def _vconcat_fallback(frames: List[np.ndarray]) -> np.ndarray:
+    """Resize all frames to common width and vertically concatenate."""
+    target_w = min(f.shape[1] for f in frames)
+    resized = []
+    for f in frames:
+        h, w = f.shape[:2]
+        new_h = int(h * target_w / w)
+        resized.append(cv2.resize(f, (target_w, new_h)))
+    return np.vstack(resized)
+
+
+# ---------------------------------------------------------------------------
+# Sequential stitching (preset scan / fallback)
+# ---------------------------------------------------------------------------
+
+def _stitch_sequential(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
+    """
+    Legacy sequential stitching for preset scans (no grid info).
+    Uses coverage-based batching with overlap.
+    """
     # Deduplicate near-identical frames
     unique = _deduplicate(frames)
     logger.info(f"Stitching {len(unique)} unique frames (from {len(frames)} captured)")
 
-    # Enhance all frames on the raw numpy arrays before any JPEG compression.
-    # Running CLAHE+gamma on the original data gives the stitcher the best
-    # possible keypoints; the JPEG only stores the already-enhanced result so
-    # no lossy round-trip degrades the data before enhancement.
     with ThreadPoolExecutor() as pool:
         unique = list(pool.map(_enhance_for_stitching, unique))
     logger.info(f"Enhanced {len(unique)} frames on raw data")
@@ -83,10 +249,6 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     if len(unique) <= BATCH_SIZE:
         return _stitch_batch(unique)
 
-    # Group frames by scan coverage before compressing: split at natural
-    # transitions (low inter-frame similarity) so each batch contains frames
-    # that actually overlap each other.  Adjacent batches share BATCH_OVERLAP
-    # frames as visual anchors for the second-level stitch.
     frame_groups = _group_indices_by_coverage(unique, batch_size=BATCH_SIZE, overlap=BATCH_OVERLAP)
     n_batches = len(frame_groups)
     logger.info(
@@ -94,9 +256,6 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
         f"(sizes: {[len(g) for g in frame_groups]})"
     )
 
-    # JPEG-compress all enhanced frames so 76×~6 MB → 76×~600 KB in memory.
-    # Only the active batch is decompressed to full-res arrays; no
-    # re-enhancement is needed after decoding.
     compressed = [cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
                   for f in unique]
     del unique
@@ -111,7 +270,7 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
         if pano is not None:
             batch_panoramas.append(pano)
         else:
-            logger.warning(f"Batch {batch_num} stitch failed — using concat fallback for this batch")
+            logger.warning(f"Batch {batch_num} stitch failed — using concat fallback")
             batch_panoramas.append(_concat_fallback(batch))
         del batch
         gc.collect()
@@ -121,37 +280,9 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     if len(batch_panoramas) == 1:
         return batch_panoramas[0], "ok"
 
-    # Stitch the batch panoramas together, also respecting BATCH_SIZE
+    # Stitch batch panoramas together
     logger.info(f"Stitching {len(batch_panoramas)} batch panoramas together…")
-    if len(batch_panoramas) <= BATCH_SIZE:
-        final, status = _stitch_batch(batch_panoramas)
-        if final is not None:
-            return final, "ok_batched"
-    else:
-        # Too many panoramas to stitch at once — batch this level too
-        n_meta = math.ceil(len(batch_panoramas) / BATCH_SIZE)
-        logger.info(f"Second-level stitch: {n_meta} meta-batches")
-        meta_panoramas: List[np.ndarray] = []
-        while batch_panoramas:
-            meta_batch, batch_panoramas = batch_panoramas[:BATCH_SIZE], batch_panoramas[BATCH_SIZE:]
-            pano, _status = _stitch_batch(meta_batch)
-            if pano is not None:
-                meta_panoramas.append(pano)
-            else:
-                meta_panoramas.append(_concat_fallback(meta_batch))
-            del meta_batch
-            gc.collect()
-        if len(meta_panoramas) == 1:
-            return meta_panoramas[0], "ok_batched"
-        final, status = _stitch_batch(meta_panoramas)
-        if final is not None:
-            return final, "ok_batched"
-        logger.warning("Meta-stitch failed — concatenating meta panoramas")
-        return _concat_fallback(meta_panoramas), "fallback_concat"
-
-    # Final fallback — concat all batch panoramas
-    logger.warning("Final stitch failed — concatenating batch panoramas")
-    return _concat_fallback(batch_panoramas), "fallback_concat"
+    return _stitch_strips(batch_panoramas)
 
 
 def _stitch_batch(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
