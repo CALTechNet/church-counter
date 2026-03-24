@@ -109,7 +109,7 @@ def _find_horizontal_overlap(a: np.ndarray, b: np.ndarray, max_overlap: float = 
     # Overlap = distance from match position to right edge of search region
     overlap_scaled = search_w - max_loc[0]
     overlap = int(overlap_scaled / scale)
-    return max(0, min(overlap, int(wa * max_overlap)))
+    return max(0, min(overlap, int(wa * max_overlap), wb))
 
 
 def _blend_horizontal(a: np.ndarray, b: np.ndarray, overlap: int) -> np.ndarray:
