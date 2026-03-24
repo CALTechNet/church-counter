@@ -10,9 +10,16 @@ The saved/displayed image uses the original brightness.
 Batching fix: frames are split into small batches before stitching
 to prevent OpenCV's bundle adjuster from consuming excessive memory
 and crashing the machine.
+
+Memory fix: waiting frames are JPEG-compressed in memory (~600 KB each
+vs ~6 MB raw) so 76 frames occupy ~45 MB instead of ~456 MB while
+batches are processed. Only the active batch is decompressed to full-res
+numpy arrays, so stitching quality and output resolution are unchanged.
 """
 import base64
+import gc
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
@@ -21,7 +28,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 6  # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
+BATCH_SIZE = 10  # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
 
 
 def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
@@ -59,28 +66,64 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     if len(unique) <= BATCH_SIZE:
         return _stitch_batch(unique)
 
-    # Split into batches and stitch each
-    batches = [unique[i:i + BATCH_SIZE] for i in range(0, len(unique), BATCH_SIZE)]
-    logger.info(f"Stitching in {len(batches)} batches of up to {BATCH_SIZE} frames")
+    # JPEG-compress waiting frames so 76×~6 MB raw → 76×~600 KB in memory.
+    # Only the active batch is decompressed to full-res arrays; output resolution
+    # is unchanged because the stitcher always receives original-quality frames.
+    n_batches = math.ceil(len(unique) / BATCH_SIZE)
+    logger.info(f"Stitching in {n_batches} batches of up to {BATCH_SIZE} frames")
+    compressed = [cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+                  for f in unique]
+    del unique
+    gc.collect()
 
-    batch_panoramas = []
-    for i, batch in enumerate(batches):
-        logger.info(f"Stitching batch {i + 1}/{len(batches)} ({len(batch)} frames)…")
-        pano, status = _stitch_batch(batch)
+    batch_panoramas: List[np.ndarray] = []
+    batch_num = 0
+    while compressed:
+        batch_compressed, compressed = compressed[:BATCH_SIZE], compressed[BATCH_SIZE:]
+        batch = [cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
+                 for b in batch_compressed]
+        del batch_compressed
+        batch_num += 1
+        logger.info(f"Stitching batch {batch_num}/{n_batches} ({len(batch)} frames)…")
+        pano, _status = _stitch_batch(batch)
         if pano is not None:
             batch_panoramas.append(pano)
         else:
-            logger.warning(f"Batch {i + 1} stitch failed — using concat fallback for this batch")
+            logger.warning(f"Batch {batch_num} stitch failed — using concat fallback for this batch")
             batch_panoramas.append(_concat_fallback(batch))
+        del batch
+        gc.collect()
 
     if len(batch_panoramas) == 1:
         return batch_panoramas[0], "ok"
 
-    # Stitch the batch panoramas together
+    # Stitch the batch panoramas together, also respecting BATCH_SIZE
     logger.info(f"Stitching {len(batch_panoramas)} batch panoramas together…")
-    final, status = _stitch_batch(batch_panoramas)
-    if final is not None:
-        return final, "ok_batched"
+    if len(batch_panoramas) <= BATCH_SIZE:
+        final, status = _stitch_batch(batch_panoramas)
+        if final is not None:
+            return final, "ok_batched"
+    else:
+        # Too many panoramas to stitch at once — batch this level too
+        n_meta = math.ceil(len(batch_panoramas) / BATCH_SIZE)
+        logger.info(f"Second-level stitch: {n_meta} meta-batches")
+        meta_panoramas: List[np.ndarray] = []
+        while batch_panoramas:
+            meta_batch, batch_panoramas = batch_panoramas[:BATCH_SIZE], batch_panoramas[BATCH_SIZE:]
+            pano, _status = _stitch_batch(meta_batch)
+            if pano is not None:
+                meta_panoramas.append(pano)
+            else:
+                meta_panoramas.append(_concat_fallback(meta_batch))
+            del meta_batch
+            gc.collect()
+        if len(meta_panoramas) == 1:
+            return meta_panoramas[0], "ok_batched"
+        final, status = _stitch_batch(meta_panoramas)
+        if final is not None:
+            return final, "ok_batched"
+        logger.warning("Meta-stitch failed — concatenating meta panoramas")
+        return _concat_fallback(meta_panoramas), "fallback_concat"
 
     # Final fallback — concat all batch panoramas
     logger.warning("Final stitch failed — concatenating batch panoramas")
