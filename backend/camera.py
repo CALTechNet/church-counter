@@ -440,20 +440,22 @@ async def _calibrated_scan(
     zoom = int(bounds.get("zoom") or tl.get("zoom") or 10000)
     zoom = max(1, zoom)
 
-    # At zoom=10000 each photo covers ~25 pan/tilt units; scale inversely with zoom
+    # At zoom=10000 each photo covers ~25 pan units; vertical step is fixed at 50
     pan_step  = max(1, int(25 * 10000 / zoom))
-    tilt_step = max(1, int(25 * 10000 / zoom))
+    tilt_step = 50
     pan_range  = abs(pan_br  - pan_tl)
     tilt_range = abs(tilt_br - tilt_tl)
     cols = max(1, math.ceil(pan_range  / pan_step)  + 1)
     rows = max(1, math.ceil(tilt_range / tilt_step) + 1)
 
-    # Build position list left-to-right for every row (top to bottom)
+    # Build position list in a reverse-S (boustrophedon) pattern:
+    # even rows go left-to-right, odd rows go right-to-left
     positions: List[tuple] = []
     for row in range(rows):
         tilt_frac = row / max(rows - 1, 1)
         tilt = int(tilt_tl + (tilt_br - tilt_tl) * tilt_frac)
-        for col in range(cols):
+        col_range = range(cols) if row % 2 == 0 else range(cols - 1, -1, -1)
+        for col in col_range:
             pan_frac = col / max(cols - 1, 1)
             pan = int(pan_tl + (pan_br - pan_tl) * pan_frac)
             positions.append((pan, tilt))
@@ -471,10 +473,11 @@ async def _calibrated_scan(
     if not positions:
         return frames
 
-    # Go to top-left (first position) and wait for camera to settle
+    # Go to top-left (first position), zoom to saved level, and wait for camera to settle
     pan0, tilt0 = positions[0]
-    await prog(f"Moving to top-left (pan={pan0}, tilt={tilt0})…", 0)
+    await prog(f"Moving to top-left (pan={pan0}, tilt={tilt0}) and zooming to {zoom}…", 0)
     await move_abs(pan0, tilt0)
+    await zoom_abs(zoom)
     await asyncio.sleep(1.5)
 
     # Capture frames during the settle window at top-left
