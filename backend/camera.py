@@ -51,6 +51,12 @@ TRAVEL_TIME      = 1.5   # seconds camera takes to travel between adjacent prese
 SETTLE_TIME      = 0     # extra seconds to wait after travel before final capture
 CAPTURE_INTERVAL = 0.25  # seconds between frame captures during movement
 
+# ── Position verification constants ──────────────────────────────────────────
+POS_TOLERANCE    = 5     # pan/tilt units — positions within this are "arrived"
+POS_POLL_INTERVAL = 0.15 # seconds between position polls
+POS_TIMEOUT      = 4.0   # seconds to wait for camera to reach target before retry
+POS_MAX_RETRIES  = 2     # number of times to resend move command if stuck
+
 
 # ── VISCA TCP helpers ─────────────────────────────────────────────────────────
 
@@ -240,6 +246,69 @@ def _get_position_sync() -> dict:
 async def get_position() -> dict:
     """Query the camera's current pan/tilt/zoom position via VISCA."""
     return await asyncio.to_thread(_get_position_sync)
+
+
+async def _await_position(
+    target_pan: int,
+    target_tilt: int,
+    move_fn,
+    tolerance: int = POS_TOLERANCE,
+    timeout: float = POS_TIMEOUT,
+    max_retries: int = POS_MAX_RETRIES,
+) -> bool:
+    """Poll until camera reaches (target_pan, target_tilt) within tolerance.
+
+    If the camera appears stuck (position unchanged between polls), resend the
+    move command via *move_fn* (an async callable) and keep waiting.  Returns
+    True if the target was reached, False if all retries were exhausted.
+    """
+    for attempt in range(1 + max_retries):
+        if attempt > 0:
+            logger.warning(
+                f"Camera stuck — resending move command "
+                f"(retry {attempt}/{max_retries}) → pan={target_pan} tilt={target_tilt}"
+            )
+            await move_fn()
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        prev_pan = prev_tilt = None
+        stall_count = 0
+
+        while asyncio.get_event_loop().time() < deadline:
+            pos = await asyncio.to_thread(_get_position_sync)
+            cur_pan, cur_tilt = pos.get("pan"), pos.get("tilt")
+
+            if cur_pan is None or cur_tilt is None:
+                # Query failed — wait and retry
+                await asyncio.sleep(POS_POLL_INTERVAL)
+                continue
+
+            # Check if we've arrived
+            if (abs(cur_pan - target_pan) <= tolerance and
+                    abs(cur_tilt - target_tilt) <= tolerance):
+                logger.debug(
+                    f"Camera arrived at pan={cur_pan} tilt={cur_tilt} "
+                    f"(target pan={target_pan} tilt={target_tilt})"
+                )
+                return True
+
+            # Detect stall: position unchanged across consecutive polls
+            if cur_pan == prev_pan and cur_tilt == prev_tilt:
+                stall_count += 1
+                if stall_count >= 3:
+                    logger.debug("Camera appears stalled, breaking to retry")
+                    break  # break inner loop to trigger retry
+            else:
+                stall_count = 0
+
+            prev_pan, prev_tilt = cur_pan, cur_tilt
+            await asyncio.sleep(POS_POLL_INTERVAL)
+
+    logger.warning(
+        f"Camera failed to reach pan={target_pan} tilt={target_tilt} "
+        f"after {max_retries} retries — proceeding anyway"
+    )
+    return False
 
 
 # ── Manual pan/tilt/zoom control ─────────────────────────────────────────────
@@ -460,25 +529,43 @@ async def _preset_scan(
 
     # Go to first preset and wait for camera to settle
     await prog(f"Moving to first preset {presets[0]}…", 0)
+    first_pos = preset_positions.get(str(presets[0]))
     await goto_preset(presets[0])
-    await asyncio.sleep(3.0)
+    if first_pos:
+        await _await_position(
+            first_pos["pan"], first_pos["tilt"],
+            lambda: goto_preset(presets[0]),
+        )
+    else:
+        await asyncio.sleep(3.0)
+    # Brief settle after arriving
+    await asyncio.sleep(0.1)
 
     if cancelled():
         return frames, grid_shape
 
-    # Capture frames during the settle window at first preset
+    # Capture frame at first preset
     f = await asyncio.to_thread(capture_frame)
     if f is not None:
         frames.append(f)
     await prog(f"Preset {presets[0]} (1/{total}) — {len(frames)} total", 0)
 
-    # Move through remaining presets; wait 25ms after each move, then capture
+    # Move through remaining presets with position verification
     for i, preset_id in enumerate(presets[1:], 1):
         if cancelled():
             return frames, grid_shape
         pct = int((i / total) * 88)
+        pos = preset_positions.get(str(preset_id))
         await goto_preset(preset_id)
-        await asyncio.sleep(0.025)
+        if pos:
+            await _await_position(
+                pos["pan"], pos["tilt"],
+                lambda pid=preset_id: goto_preset(pid),
+            )
+        else:
+            await asyncio.sleep(TRAVEL_TIME)
+        # Brief settle for vibration damping
+        await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
@@ -587,29 +674,39 @@ async def _calibrated_scan(
     if not positions:
         return frames
 
-    # Go to top-left (first position), zoom to saved level, and wait for camera to settle
+    # Go to top-left (first position), zoom to saved level, and verify arrival
     pan0, tilt0 = positions[0]
     await prog(f"Moving to top-left (pan={pan0}, tilt={tilt0}) and zooming to {zoom}…", 0)
     await move_abs(pan0, tilt0)
     await zoom_abs(zoom)
-    await asyncio.sleep(3.0)
+    await _await_position(
+        pan0, tilt0,
+        lambda: move_abs(pan0, tilt0),
+    )
+    # Brief settle for vibration damping
+    await asyncio.sleep(0.1)
 
     if cancelled():
         return frames
 
-    # Capture frames during the settle window at top-left
+    # Capture frame at first position
     f = await asyncio.to_thread(capture_frame)
     if f is not None:
         frames.append(f)
     await prog(f"Position 1/{total} (pan={pan0}, tilt={tilt0}) — {len(frames)} total", 0)
 
-    # Move through remaining positions; wait 25ms after each move for vibration to settle, then capture
+    # Move through remaining positions with position verification
     for i, (pan, tilt) in enumerate(positions[1:], 1):
         if cancelled():
             return frames
         pct = int((i / total) * 88)
         await move_abs(pan, tilt, pan_speed=24, tilt_speed=20)
-        await asyncio.sleep(0.025)
+        await _await_position(
+            pan, tilt,
+            lambda p=pan, t=tilt: move_abs(p, t, pan_speed=24, tilt_speed=20),
+        )
+        # Brief settle for vibration damping
+        await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
