@@ -4,7 +4,8 @@ import AttendanceGraph from './components/AttendanceGraph.jsx'
 import DataTable from './components/DataTable.jsx'
 import LiveView from './components/LiveView.jsx'
 import CalibrationWizard from './components/CalibrationWizard.jsx'
-import { getStatus, triggerScan, createWebSocket, getPtzPosition } from './api.js'
+import SettingsModal from './components/SettingsModal.jsx'
+import { getStatus, triggerScan, createWebSocket, getPtzPosition, getSettings } from './api.js'
 import { VERSION } from './version.js'
 import { useIsMobile } from './hooks/useIsMobile.js'
 
@@ -36,17 +37,19 @@ export default function App() {
   const [scanStartedAt, setScanStartedAt] = useState(null)
   const [zoomImageB64, setZoomImageB64] = useState(null)
   const [serviceType, setServiceType] = useState('Manual')
-  const [showCal, setShowCal]     = useState(false)
+  const [showCal, setShowCal]         = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
   const [hasCalibration, setHasCalibration] = useState(false)
   const [toast, setToast]         = useState(null)
   const [ptzPos, setPtzPos]       = useState(null)
+  const [churchName, setChurchName] = useState('Lakeshore Church')
 
   const showToast = (msg, color = C.green) => {
     setToast({ msg, color })
     setTimeout(() => setToast(null), 3500)
   }
 
-  // Bootstrap status
+  // Bootstrap status + settings
   useEffect(() => {
     getStatus().then(s => {
       setScanState({ running: s.running, progress: s.progress, message: s.message })
@@ -55,6 +58,9 @@ export default function App() {
       setLatestTs(s.latest_timestamp)
       setLatestService(s.latest_service)
       setHasCalibration(s.has_calibration)
+    }).catch(() => {})
+    getSettings().then(s => {
+      if (s.church_name) setChurchName(s.church_name)
     }).catch(() => {})
   }, [])
 
@@ -131,7 +137,7 @@ export default function App() {
       }}>
         {/* Branding */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: isMobile ? '1 1 auto' : '0 0 auto' }}>
-          <span style={{ fontSize: isMobile ? 18 : 22, fontWeight: 700, letterSpacing: '-0.5px', whiteSpace: 'nowrap' }}>⛪ Lakeshore Church</span>
+          <span style={{ fontSize: isMobile ? 18 : 22, fontWeight: 700, letterSpacing: '-0.5px', whiteSpace: 'nowrap' }}>⛪ {churchName}</span>
           {!isMobile && <span style={{ color: C.muted, fontSize: 14 }}>Attendance Counter</span>}
         </div>
 
@@ -202,6 +208,14 @@ export default function App() {
           >
             ⚙{!isMobile && ' Calibrate'}
           </button>
+
+          <button
+            onClick={() => setShowSettings(true)}
+            title="Settings"
+            style={{ background: 'transparent', color: C.muted, border: `1px solid ${C.border}`, borderRadius: 8, padding: '7px 12px', fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' }}
+          >
+            {isMobile ? '⚙' : '⚙ Settings'}
+          </button>
         </div>
       </header>
 
@@ -241,6 +255,14 @@ export default function App() {
       {showCal && (
         <CalibrationWizard
           onClose={() => { setShowCal(false); setHasCalibration(true) }}
+        />
+      )}
+
+      {/* Settings modal */}
+      {showSettings && (
+        <SettingsModal
+          onClose={() => setShowSettings(false)}
+          onSave={s => { if (s.church_name) setChurchName(s.church_name) }}
         />
       )}
 
