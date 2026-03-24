@@ -260,13 +260,11 @@ def _composite_homography(
     canvas_h = int(np.ceil(max_y - min_y))
 
     # Cap canvas to prevent memory blow-up.
-    # Limit by total pixel area (not just max dimension) so wide panoramas
-    # like 16000×6522 (~104 Mpx) don't OOM a 4 GB container.
-    # 40 Mpx ≈ peak ~2.2 GB with float32 buffers — safe for 4 GB limit.
-    max_pixels = 40_000_000
-    n_pixels = canvas_w * canvas_h
-    if n_pixels > max_pixels:
-        s = (max_pixels / n_pixels) ** 0.5
+    # With float32 buffers, peak memory ≈ 32 bytes/pixel × frame count overhead.
+    # 16000 max dim keeps worst-case (16000×16000) under ~10 GB.
+    max_dim = 16000
+    if max(canvas_w, canvas_h) > max_dim:
+        s = max_dim / max(canvas_w, canvas_h)
         S = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float64)
         T = S @ T
         canvas_w = int(canvas_w * s)
