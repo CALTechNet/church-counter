@@ -1,11 +1,15 @@
 """
 Frame stitching for panorama generation.
-Primary: OpenCV Stitcher (RANSAC-based feature matching)
+Primary: OpenCV Stitcher (RANSAC-based feature matching), batched
 Fallback: Horizontal concat (resized to common height)
 
 Low-light fix: frames are contrast-enhanced before feature detection
 so the stitcher finds enough keypoints at 52% house lights.
 The saved/displayed image uses the original brightness.
+
+Batching fix: frames are split into small batches before stitching
+to prevent OpenCV's bundle adjuster from consuming excessive memory
+and crashing the machine.
 """
 import base64
 import logging
@@ -16,6 +20,8 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+BATCH_SIZE = 6  # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
 
 
 def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
@@ -35,8 +41,9 @@ def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
 
 def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     """
-    Stitch frames into a panorama.
-    Enhances frames for feature detection but outputs original-brightness panorama.
+    Stitch frames into a panorama using batched stitching.
+    Splits frames into batches of BATCH_SIZE, stitches each batch,
+    then stitches the resulting batch panoramas together.
     Returns (image, status_message).
     """
     if not frames:
@@ -49,36 +56,75 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     unique = _deduplicate(frames)
     logger.info(f"Stitching {len(unique)} unique frames (from {len(frames)} captured)")
 
+    if len(unique) <= BATCH_SIZE:
+        return _stitch_batch(unique)
+
+    # Split into batches and stitch each
+    batches = [unique[i:i + BATCH_SIZE] for i in range(0, len(unique), BATCH_SIZE)]
+    logger.info(f"Stitching in {len(batches)} batches of up to {BATCH_SIZE} frames")
+
+    batch_panoramas = []
+    for i, batch in enumerate(batches):
+        logger.info(f"Stitching batch {i + 1}/{len(batches)} ({len(batch)} frames)…")
+        pano, status = _stitch_batch(batch)
+        if pano is not None:
+            batch_panoramas.append(pano)
+        else:
+            logger.warning(f"Batch {i + 1} stitch failed — using concat fallback for this batch")
+            batch_panoramas.append(_concat_fallback(batch))
+
+    if len(batch_panoramas) == 1:
+        return batch_panoramas[0], "ok"
+
+    # Stitch the batch panoramas together
+    logger.info(f"Stitching {len(batch_panoramas)} batch panoramas together…")
+    final, status = _stitch_batch(batch_panoramas)
+    if final is not None:
+        return final, "ok_batched"
+
+    # Final fallback — concat all batch panoramas
+    logger.warning("Final stitch failed — concatenating batch panoramas")
+    return _concat_fallback(batch_panoramas), "fallback_concat"
+
+
+def _stitch_batch(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
+    """Stitch a small batch of frames using OpenCV stitcher with low-light enhancement."""
+    if len(frames) == 1:
+        return frames[0], "single_frame"
+
     # Try stitching with enhanced frames first (better keypoint detection in low light)
     with ThreadPoolExecutor() as pool:
-        enhanced = list(pool.map(_enhance_for_stitching, unique))
+        enhanced = list(pool.map(_enhance_for_stitching, frames))
+
     stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
     status, pano = stitcher.stitch(enhanced)
-
     if status == cv2.Stitcher_OK:
         pano = _crop_black(pano)
-        logger.info(f"Stitch OK (enhanced) — output shape: {pano.shape}")
+        logger.info(f"Batch stitch OK (enhanced) — shape {pano.shape}")
         return pano, "ok"
 
-    logger.warning(f"Enhanced stitch failed (status={status}), trying original frames…")
+    logger.warning(f"Enhanced batch stitch failed (status={status}), trying original frames…")
 
     # Retry with original frames
-    status2, pano2 = stitcher.stitch(unique)
+    status2, pano2 = stitcher.stitch(frames)
     if status2 == cv2.Stitcher_OK:
         pano2 = _crop_black(pano2)
-        logger.info(f"Stitch OK (original) — output shape: {pano2.shape}")
+        logger.info(f"Batch stitch OK (original) — shape {pano2.shape}")
         return pano2, "ok_original"
 
-    logger.warning(f"Both stitch attempts failed, using fallback concat")
+    logger.warning(f"Batch stitch failed (status={status2})")
+    return None, f"failed_{status2}"
 
-    # Fallback: resize all to same height, concat
-    target_h = min(f.shape[0] for f in unique)
+
+def _concat_fallback(frames: List[np.ndarray]) -> np.ndarray:
+    """Resize all frames to common height and horizontally concatenate."""
+    target_h = min(f.shape[0] for f in frames)
     resized = []
-    for f in unique:
+    for f in frames:
         h, w = f.shape[:2]
         new_w = int(w * target_h / h)
         resized.append(cv2.resize(f, (new_w, target_h)))
-    return np.hstack(resized), "fallback_concat"
+    return np.hstack(resized)
 
 
 def _deduplicate(frames: List[np.ndarray], threshold: float = 0.97) -> List[np.ndarray]:
