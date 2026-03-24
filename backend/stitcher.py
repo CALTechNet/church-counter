@@ -105,9 +105,17 @@ def stitch_frames(
     grid_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Optional[np.ndarray], str]:
     """
-    Stitch frames into a panorama — only ever 2 frames per OpenCV call.
-    Walks through every frame in order, stitching each onto the accumulator.
-    grid_shape is accepted but ignored (kept for API compat).
+    Stitch frames into a panorama.
+
+    When grid_shape (rows, cols) is provided (calibrated PTZ scan), frames are
+    assumed to be in column-major boustrophedon order (down col 0, up col 1, …).
+    They are rearranged into rows, each row is stitched independently, then
+    rows are vertically concatenated.  This avoids the accumulator-growth
+    problem where a huge panorama can't match features with a small new frame.
+
+    Without grid_shape, falls back to sequential pair-wise stitching with
+    deduplication.
+
     Returns (image, status_message).
     """
     if not frames:
@@ -116,7 +124,16 @@ def stitch_frames(
     if len(frames) == 1:
         return frames[0], "single_frame"
 
-    # Deduplicate near-identical frames
+    if grid_shape and len(grid_shape) == 2:
+        rows, cols = grid_shape
+        if rows * cols == len(frames):
+            return _stitch_grid(frames, rows, cols)
+        logger.warning(
+            f"grid_shape {grid_shape} doesn't match frame count {len(frames)}, "
+            "falling back to sequential stitch"
+        )
+
+    # Fallback: sequential stitch with deduplication
     unique = _deduplicate(frames)
     n = len(unique)
     logger.info(f"Stitching {n} unique frames (from {len(frames)} captured)")
@@ -125,6 +142,65 @@ def stitch_frames(
     result = _crop_black(result)
     logger.info(f"Stitch complete — output shape: {result.shape}")
     return result, "ok"
+
+
+def _stitch_grid(
+    frames: List[np.ndarray], rows: int, cols: int,
+) -> Tuple[Optional[np.ndarray], str]:
+    """
+    Stitch frames captured in column-major boustrophedon order into a panorama.
+
+    1. Rearrange into a row-major grid (grid[row][col]).
+    2. Stitch each row left-to-right using pair-wise stitching.
+    3. Vertically concatenate all row strips.
+    """
+    logger.info(f"Grid stitch: {rows}r × {cols}c = {rows * cols} frames")
+
+    # Build grid[row][col] from column-major boustrophedon order
+    grid: List[List[np.ndarray]] = [[None] * cols for _ in range(rows)]
+    idx = 0
+    for col in range(cols):
+        row_range = range(rows) if col % 2 == 0 else range(rows - 1, -1, -1)
+        for row in row_range:
+            grid[row][col] = frames[idx]
+            idx += 1
+
+    # Stitch each row independently
+    row_strips = []
+    for r in range(rows):
+        row_frames = [f for f in grid[r] if f is not None]
+        if not row_frames:
+            continue
+        logger.info(f"  Stitching row {r + 1}/{rows} ({len(row_frames)} frames)")
+        strip = _stitch_sequential(row_frames, label=f"row{r + 1}: ")
+        row_strips.append(strip)
+        gc.collect()
+
+    if not row_strips:
+        return None, "grid_empty"
+
+    if len(row_strips) == 1:
+        result = row_strips[0]
+    else:
+        # Vertically concatenate rows (resize to common width)
+        result = _vconcat_strips(row_strips)
+
+    result = _crop_black(result)
+    logger.info(f"Grid stitch complete — output shape: {result.shape}")
+    return result, "ok_grid"
+
+
+def _vconcat_strips(strips: List[np.ndarray]) -> np.ndarray:
+    """Resize strips to the same width, then vertically concatenate."""
+    target_w = max(s.shape[1] for s in strips)
+    resized = []
+    for s in strips:
+        h, w = s.shape[:2]
+        if w != target_w:
+            new_h = int(h * target_w / w)
+            s = cv2.resize(s, (target_w, new_h))
+        resized.append(s)
+    return np.vstack(resized)
 
 
 def _deduplicate(frames: List[np.ndarray], threshold: float = 0.97) -> List[np.ndarray]:
