@@ -10,9 +10,15 @@ The saved/displayed image uses the original brightness.
 Batching fix: frames are split into small batches before stitching
 to prevent OpenCV's bundle adjuster from consuming excessive memory
 and crashing the machine.
+
+Memory fix: frames are downscaled to STITCH_MAX_WIDTH before stitching
+and released batch-by-batch so a large calibrated scan (80+ frames) does
+not exhaust RAM before the first batch even starts.
 """
 import base64
+import gc
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
@@ -21,7 +27,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 6  # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
+BATCH_SIZE = 6        # max frames per stitch batch — keeps OpenCV's bundle adjuster stable
+STITCH_MAX_WIDTH = 960  # downscale wider frames before stitching to cap RAM usage
 
 
 def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
@@ -37,6 +44,15 @@ def _enhance_for_stitching(frame: np.ndarray) -> np.ndarray:
     # Gamma 2.0 lift
     lut = np.array([((i / 255.0) ** (1.0 / 2.0)) * 255 for i in range(256)], dtype=np.uint8)
     return cv2.LUT(enhanced, lut)
+
+
+def _downscale_for_stitch(frame: np.ndarray) -> np.ndarray:
+    """Downscale frame to STITCH_MAX_WIDTH if wider, preserving aspect ratio."""
+    h, w = frame.shape[:2]
+    if w <= STITCH_MAX_WIDTH:
+        return frame
+    new_h = int(h * STITCH_MAX_WIDTH / w)
+    return cv2.resize(frame, (STITCH_MAX_WIDTH, new_h), interpolation=cv2.INTER_AREA)
 
 
 def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
@@ -56,31 +72,61 @@ def stitch_frames(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
     unique = _deduplicate(frames)
     logger.info(f"Stitching {len(unique)} unique frames (from {len(frames)} captured)")
 
+    # Downscale frames to cap per-frame RAM (e.g. 1080p → 960px wide = ~4× less memory)
+    unique = [_downscale_for_stitch(f) for f in unique]
+
     if len(unique) <= BATCH_SIZE:
         return _stitch_batch(unique)
 
-    # Split into batches and stitch each
-    batches = [unique[i:i + BATCH_SIZE] for i in range(0, len(unique), BATCH_SIZE)]
-    logger.info(f"Stitching in {len(batches)} batches of up to {BATCH_SIZE} frames")
+    # Split into batches and stitch each, releasing originals as we go
+    n_batches = math.ceil(len(unique) / BATCH_SIZE)
+    logger.info(f"Stitching in {n_batches} batches of up to {BATCH_SIZE} frames")
 
-    batch_panoramas = []
-    for i, batch in enumerate(batches):
-        logger.info(f"Stitching batch {i + 1}/{len(batches)} ({len(batch)} frames)…")
-        pano, status = _stitch_batch(batch)
+    batch_panoramas: List[np.ndarray] = []
+    batch_num = 0
+    while unique:
+        batch, unique = unique[:BATCH_SIZE], unique[BATCH_SIZE:]
+        batch_num += 1
+        logger.info(f"Stitching batch {batch_num}/{n_batches} ({len(batch)} frames)…")
+        pano, _status = _stitch_batch(batch)
         if pano is not None:
             batch_panoramas.append(pano)
         else:
-            logger.warning(f"Batch {i + 1} stitch failed — using concat fallback for this batch")
+            logger.warning(f"Batch {batch_num} stitch failed — using concat fallback for this batch")
             batch_panoramas.append(_concat_fallback(batch))
+        del batch
+        gc.collect()
 
     if len(batch_panoramas) == 1:
         return batch_panoramas[0], "ok"
 
-    # Stitch the batch panoramas together
+    # Stitch the batch panoramas together, also respecting BATCH_SIZE
     logger.info(f"Stitching {len(batch_panoramas)} batch panoramas together…")
-    final, status = _stitch_batch(batch_panoramas)
-    if final is not None:
-        return final, "ok_batched"
+    if len(batch_panoramas) <= BATCH_SIZE:
+        final, status = _stitch_batch(batch_panoramas)
+        if final is not None:
+            return final, "ok_batched"
+    else:
+        # Too many panoramas to stitch at once — batch this level too
+        n_meta = math.ceil(len(batch_panoramas) / BATCH_SIZE)
+        logger.info(f"Second-level stitch: {n_meta} meta-batches")
+        meta_panoramas: List[np.ndarray] = []
+        while batch_panoramas:
+            meta_batch, batch_panoramas = batch_panoramas[:BATCH_SIZE], batch_panoramas[BATCH_SIZE:]
+            pano, _status = _stitch_batch(meta_batch)
+            if pano is not None:
+                meta_panoramas.append(pano)
+            else:
+                meta_panoramas.append(_concat_fallback(meta_batch))
+            del meta_batch
+            gc.collect()
+        if len(meta_panoramas) == 1:
+            return meta_panoramas[0], "ok_batched"
+        final, status = _stitch_batch(meta_panoramas)
+        if final is not None:
+            return final, "ok_batched"
+        logger.warning("Meta-stitch failed — concatenating meta panoramas")
+        return _concat_fallback(meta_panoramas), "fallback_concat"
 
     # Final fallback — concat all batch panoramas
     logger.warning("Final stitch failed — concatenating batch panoramas")
