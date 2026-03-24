@@ -257,6 +257,24 @@ async def zoom_stop():
     await asyncio.to_thread(_zoom_sync, 0x00, 0)
 
 
+def _zoom_abs_sync(zoom: int):
+    """Set absolute zoom position via VISCA 8x 01 04 47 0p 0q 0r 0s FF (blocking)."""
+    z = _encode_visca_pos(zoom)
+    cmd = bytes([0x81, 0x01, 0x04, 0x47, z[0], z[1], z[2], z[3], 0xFF])
+    try:
+        s = _visca_connect()
+        _visca_send(s, cmd)
+        s.close()
+    except Exception as exc:
+        logger.warning(f"VISCA absolute zoom failed: {exc}")
+
+
+async def zoom_abs(zoom: int):
+    """Set camera zoom to an absolute VISCA position."""
+    await asyncio.to_thread(_zoom_abs_sync, zoom)
+    logger.debug(f"VISCA absolute zoom={zoom}")
+
+
 # ── Frame capture ─────────────────────────────────────────────────────────────
 def capture_frame(url: str = None) -> Optional[np.ndarray]:
     """Open RTSP stream, flush buffer, return latest frame."""
@@ -321,12 +339,13 @@ async def _preset_scan(
 
 
 async def _calibrated_scan(
-    scan_positions: int = 24,
     progress_callback: Optional[ProgressCB] = None,
 ) -> List[np.ndarray]:
     """
     Move camera through a grid of absolute PTZ positions between the saved
     top-left and bottom-right bounds, capturing frames at each stop.
+    Grid density is calculated from the saved zoom level: at zoom=10000,
+    each photo covers ~25 pan units and ~25 tilt units.
     """
     import database as db
     bounds = db.get_config("camera_bounds", {})
@@ -339,10 +358,17 @@ async def _calibrated_scan(
     pan_tl, tilt_tl = int(tl["pan"]), int(tl["tilt"])
     pan_br, tilt_br = int(br["pan"]), int(br["tilt"])
 
-    # Build grid: aspect ratio ~1.78:1 (pan:tilt) for a typical wide sanctuary
-    n = max(4, scan_positions)
-    cols = max(1, round(math.sqrt(n * 1.78)))
-    rows = max(1, round(n / cols))
+    # Use the override zoom if set, otherwise use the top-left corner zoom
+    zoom = int(bounds.get("zoom") or tl.get("zoom") or 10000)
+    zoom = max(1, zoom)
+
+    # At zoom=10000 each photo covers ~25 pan/tilt units; scale inversely with zoom
+    pan_step  = max(1, int(25 * 10000 / zoom))
+    tilt_step = max(1, int(25 * 10000 / zoom))
+    pan_range  = abs(pan_br  - pan_tl)
+    tilt_range = abs(tilt_br - tilt_tl)
+    cols = max(1, math.ceil(pan_range  / pan_step)  + 1)
+    rows = max(1, math.ceil(tilt_range / tilt_step) + 1)
 
     # Build zigzag position list (left→right on even rows, right→left on odd)
     positions: List[tuple] = []
@@ -400,8 +426,7 @@ async def auto_scan(progress_callback: Optional[ProgressCB] = None) -> List[np.n
     mode = settings.get("scan_mode", "preset")
 
     if mode == "calibrated":
-        scan_positions = int(settings.get("scan_positions", 24))
-        return await _calibrated_scan(scan_positions=scan_positions, progress_callback=progress_callback)
+        return await _calibrated_scan(progress_callback=progress_callback)
     else:
         preset_start = int(settings.get("preset_start", 100))
         preset_end   = int(settings.get("preset_end",   131))

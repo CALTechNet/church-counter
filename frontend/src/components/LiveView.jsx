@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { ptzCommand } from '../api.js'
+import { ptzCommand, gotoBound, getCameraBounds } from '../api.js'
 import { useIsMobile } from '../hooks/useIsMobile.js'
 
 const C = {
@@ -19,7 +19,12 @@ export default function LiveView({ scanning, ptzPos }) {
   const [frameSrc, setFrameSrc] = useState(null)
   const [error, setError]       = useState(null)
   const [fps, setFps]           = useState(null)
+  const [bounds, setBounds]     = useState(null)
   const lastFrameTime = useRef(null)
+
+  useEffect(() => {
+    getCameraBounds().then(setBounds).catch(() => {})
+  }, [])
 
   // Poll /api/live-frame continuously while this tab is mounted
   useEffect(() => {
@@ -182,8 +187,50 @@ export default function LiveView({ scanning, ptzPos }) {
           <PtzBtn label="＋ Zoom" wide onStart={() => sendPtz('zoomin')}  onEnd={() => ptzCommand('zoomstop').catch(() => {})} />
           <PtzBtn label="－ Zoom" wide onStart={() => sendPtz('zoomout')} onEnd={() => ptzCommand('zoomstop').catch(() => {})} />
         </div>
+
+        {/* Bounds shortcuts */}
+        {bounds && (bounds.top_left || bounds.bottom_right) && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div style={{ color: C.muted, fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', textAlign: 'center' }}>
+              Bounds
+            </div>
+            {bounds.top_left && (
+              <GoToBoundBtn label="↖ Top-Left" onClick={() => gotoBound('top_left').catch(() => {})} />
+            )}
+            {bounds.bottom_right && (
+              <GoToBoundBtn label="↘ Bot-Right" onClick={() => gotoBound('bottom_right').catch(() => {})} />
+            )}
+          </div>
+        )}
       </div>
     </div>
+  )
+}
+
+// ── One-shot button for going to a saved bound position ──────────────────────
+function GoToBoundBtn({ label, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: '#0f172a',
+        border: `1px solid ${C.border}`,
+        color: C.text,
+        borderRadius: 6,
+        cursor: 'pointer',
+        fontWeight: 600,
+        fontSize: 11,
+        width: 132,
+        height: 34,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        userSelect: 'none',
+        WebkitUserSelect: 'none',
+      }}
+    >
+      {label}
+    </button>
   )
 }
 
