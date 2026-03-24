@@ -315,6 +315,45 @@ async def api_clear_cal():
     return {"status": "cleared"}
 
 
+# ── App settings ──────────────────────────────────────────────────────────────
+class AppSettings(BaseModel):
+    church_name:    Optional[str] = None
+    camera_ip:      Optional[str] = None
+    camera_user:    Optional[str] = None
+    camera_pass:    Optional[str] = None
+    scan_mode:      Optional[str] = None   # "preset" | "calibrated"
+    preset_start:   Optional[int] = None
+    preset_end:     Optional[int] = None
+    scan_positions: Optional[int] = None
+
+
+_SETTINGS_DEFAULTS = {
+    "church_name":    "Lakeshore Church",
+    "camera_ip":      "10.10.140.140",
+    "camera_user":    "admin",
+    "camera_pass":    "admin",
+    "scan_mode":      "preset",
+    "preset_start":   100,
+    "preset_end":     131,
+    "scan_positions": 24,
+}
+
+
+@app.get("/api/settings")
+async def api_get_settings():
+    saved = db.get_config("app_settings", {})
+    return {**_SETTINGS_DEFAULTS, **saved}
+
+
+@app.post("/api/settings")
+async def api_save_settings(body: AppSettings):
+    existing = db.get_config("app_settings", {})
+    patch = body.model_dump(exclude_none=True)
+    existing.update(patch)
+    db.set_config("app_settings", existing)
+    return {**_SETTINGS_DEFAULTS, **existing}
+
+
 # ── Camera bounds (top-left / bottom-right scan corners) ─────────────────────
 class CameraBounds(BaseModel):
     top_left:     Optional[dict] = None   # {pan, tilt, zoom}

@@ -7,6 +7,7 @@ Uses VISCA over TCP (port 5678) for PTZ control.
 """
 import asyncio
 import logging
+import math
 import socket
 import time
 from typing import List, Optional, Callable, Awaitable
@@ -16,12 +17,29 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-CAMERA_IP = "10.10.140.140"
+# Default / fallback values (overridden by DB settings at runtime)
+CAMERA_IP  = "10.10.140.140"
 VISCA_PORT = 5678
-RTSP_URL = f"rtsp://{CAMERA_IP}:554/1"
+RTSP_URL   = f"rtsp://{CAMERA_IP}:554/1"
 
 # ── Scan presets — zigzag grid 100–131 ───────────────────────────────────────
 SCAN_PRESETS = list(range(100, 132))
+
+
+# ── Runtime-configurable helpers ─────────────────────────────────────────────
+
+def _get_camera_ip() -> str:
+    try:
+        import database as db
+        s = db.get_config("app_settings", {})
+        return s.get("camera_ip") or CAMERA_IP
+    except Exception:
+        return CAMERA_IP
+
+
+def _get_rtsp_url() -> str:
+    ip = _get_camera_ip()
+    return f"rtsp://{ip}:554/1"
 
 HOME_PRESET = 0
 
@@ -36,7 +54,7 @@ CAPTURE_INTERVAL = 0.25  # seconds between frame captures during movement
 def _visca_connect() -> socket.socket:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(4.0)
-    s.connect((CAMERA_IP, VISCA_PORT))
+    s.connect((_get_camera_ip(), VISCA_PORT))
     return s
 
 
@@ -100,6 +118,39 @@ async def go_home():
     await asyncio.to_thread(_go_home_sync)
     await asyncio.sleep(1.0)
     logger.info("Camera returned to home position")
+
+
+# ── Absolute PTZ move (VISCA) ─────────────────────────────────────────────────
+
+def _encode_visca_pos(v: int) -> list:
+    """Encode a signed 16-bit integer into 4 VISCA nibble bytes."""
+    u = v & 0xFFFF
+    return [
+        0x00 | ((u >> 12) & 0x0F),
+        0x00 | ((u >>  8) & 0x0F),
+        0x00 | ((u >>  4) & 0x0F),
+        0x00 | ((u      ) & 0x0F),
+    ]
+
+
+def _move_abs_sync(pan: int, tilt: int, pan_speed: int = 6, tilt_speed: int = 6):
+    """VISCA 8x 01 06 02 VV WW [pan×4] [tilt×4] FF — blocking."""
+    p = _encode_visca_pos(pan)
+    t = _encode_visca_pos(tilt)
+    cmd = bytes([0x81, 0x01, 0x06, 0x02, pan_speed & 0x1F, tilt_speed & 0x1F,
+                 p[0], p[1], p[2], p[3], t[0], t[1], t[2], t[3], 0xFF])
+    try:
+        s = _visca_connect()
+        _visca_send(s, cmd)
+        s.close()
+    except Exception as exc:
+        logger.warning(f"VISCA absolute move failed: {exc}")
+
+
+async def move_abs(pan: int, tilt: int, pan_speed: int = 6, tilt_speed: int = 6):
+    """Move camera to absolute pan/tilt position."""
+    await asyncio.to_thread(_move_abs_sync, pan, tilt, pan_speed, tilt_speed)
+    logger.debug(f"VISCA absolute move pan={pan} tilt={tilt}")
 
 
 # ── Position query ─────────────────────────────────────────────────────────────
@@ -207,8 +258,10 @@ async def zoom_stop():
 
 
 # ── Frame capture ─────────────────────────────────────────────────────────────
-def capture_frame(url: str = RTSP_URL) -> Optional[np.ndarray]:
+def capture_frame(url: str = None) -> Optional[np.ndarray]:
     """Open RTSP stream, flush buffer, return latest frame."""
+    if url is None:
+        url = _get_rtsp_url()
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     frame = None
@@ -226,49 +279,131 @@ def capture_frame(url: str = RTSP_URL) -> Optional[np.ndarray]:
 ProgressCB = Callable[[str, int], Awaitable[None]]
 
 
-async def auto_scan(progress_callback: Optional[ProgressCB] = None) -> List[np.ndarray]:
-    """
-    Visit all presets in zigzag order.
-    For each preset: send move command, then capture frames continuously
-    during travel + settle, giving the stitcher dense overlapping coverage.
-    Returns list of all captured frames for stitching.
-    """
+async def _preset_scan(
+    presets: List[int],
+    progress_callback: Optional[ProgressCB] = None,
+) -> List[np.ndarray]:
+    """Visit a list of VISCA presets, capturing frames continuously during each move."""
     frames: List[np.ndarray] = []
-    total = len(SCAN_PRESETS)
-    capture_window = TRAVEL_TIME + SETTLE_TIME  # total seconds to capture per preset
+    total = len(presets)
+    capture_window = TRAVEL_TIME + SETTLE_TIME
 
     async def prog(msg: str, pct: int):
         logger.info(f"[{pct:3d}%] {msg}")
         if progress_callback:
             await progress_callback(msg, pct)
 
-    await prog("Starting grid scan…", 0)
+    await prog("Starting preset scan…", 0)
 
-    for i, preset_id in enumerate(SCAN_PRESETS):
+    for i, preset_id in enumerate(presets):
         pct = int((i / total) * 88)
-
-        # Send move command (don't await movement — start capturing immediately)
         await call_preset(preset_id)
 
-        # Capture frames continuously while camera is moving and settling
         deadline = time.monotonic() + capture_window
-        frames_this_preset = 0
+        frames_this = 0
         while time.monotonic() < deadline:
             f = await asyncio.to_thread(capture_frame)
             if f is not None:
                 frames.append(f)
-                frames_this_preset += 1
+                frames_this += 1
             await asyncio.sleep(CAPTURE_INTERVAL)
 
         await prog(
-            f"Preset {preset_id} ({i+1}/{total}) — {frames_this_preset} frames captured, {len(frames)} total",
+            f"Preset {preset_id} ({i+1}/{total}) — {frames_this} frames, {len(frames)} total",
             pct,
         )
 
-    # ── Return home ───────────────────────────────────────────────────────────
-    await prog("Returning camera to home position…", 90)
+    await prog("Returning camera to home…", 90)
     await go_home()
-
     await prog(f"Capture complete — {len(frames)} frames", 92)
-    logger.info(f"auto_scan finished: {len(frames)} frames captured across {total} presets")
+    logger.info(f"_preset_scan done: {len(frames)} frames across {total} presets")
     return frames
+
+
+async def _calibrated_scan(
+    scan_positions: int = 24,
+    progress_callback: Optional[ProgressCB] = None,
+) -> List[np.ndarray]:
+    """
+    Move camera through a grid of absolute PTZ positions between the saved
+    top-left and bottom-right bounds, capturing frames at each stop.
+    """
+    import database as db
+    bounds = db.get_config("camera_bounds", {})
+    tl = bounds.get("top_left")
+    br = bounds.get("bottom_right")
+    if not tl or not br:
+        logger.error("No camera bounds saved — cannot do calibrated scan. Set bounds in Calibration.")
+        return []
+
+    pan_tl, tilt_tl = int(tl["pan"]), int(tl["tilt"])
+    pan_br, tilt_br = int(br["pan"]), int(br["tilt"])
+
+    # Build grid: aspect ratio ~1.78:1 (pan:tilt) for a typical wide sanctuary
+    n = max(4, scan_positions)
+    cols = max(1, round(math.sqrt(n * 1.78)))
+    rows = max(1, round(n / cols))
+
+    # Build zigzag position list (left→right on even rows, right→left on odd)
+    positions: List[tuple] = []
+    for row in range(rows):
+        tilt_frac = row / max(rows - 1, 1)
+        tilt = int(tilt_tl + (tilt_br - tilt_tl) * tilt_frac)
+        col_range = range(cols) if row % 2 == 0 else range(cols - 1, -1, -1)
+        for col in col_range:
+            pan_frac = col / max(cols - 1, 1)
+            pan = int(pan_tl + (pan_br - pan_tl) * pan_frac)
+            positions.append((pan, tilt))
+
+    frames: List[np.ndarray] = []
+    total = len(positions)
+
+    async def prog(msg: str, pct: int):
+        logger.info(f"[{pct:3d}%] {msg}")
+        if progress_callback:
+            await progress_callback(msg, pct)
+
+    await prog(f"Starting calibrated scan ({rows}×{cols} grid, {total} positions)…", 0)
+
+    for i, (pan, tilt) in enumerate(positions):
+        pct = int((i / total) * 88)
+        await move_abs(pan, tilt)
+        await asyncio.sleep(TRAVEL_TIME + SETTLE_TIME)
+
+        deadline = time.monotonic() + 0.6
+        frames_this = 0
+        while time.monotonic() < deadline:
+            f = await asyncio.to_thread(capture_frame)
+            if f is not None:
+                frames.append(f)
+                frames_this += 1
+            await asyncio.sleep(CAPTURE_INTERVAL)
+
+        await prog(
+            f"Position {i+1}/{total} (pan={pan}, tilt={tilt}) — {frames_this} frames, {len(frames)} total",
+            pct,
+        )
+
+    await prog("Returning camera to home…", 90)
+    await go_home()
+    await prog(f"Capture complete — {len(frames)} frames", 92)
+    logger.info(f"_calibrated_scan done: {len(frames)} frames across {total} positions")
+    return frames
+
+
+async def auto_scan(progress_callback: Optional[ProgressCB] = None) -> List[np.ndarray]:
+    """
+    Dispatch to either preset or calibrated scan based on saved app settings.
+    """
+    import database as db
+    settings = db.get_config("app_settings", {})
+    mode = settings.get("scan_mode", "preset")
+
+    if mode == "calibrated":
+        scan_positions = int(settings.get("scan_positions", 24))
+        return await _calibrated_scan(scan_positions=scan_positions, progress_callback=progress_callback)
+    else:
+        preset_start = int(settings.get("preset_start", 100))
+        preset_end   = int(settings.get("preset_end",   131))
+        presets = list(range(preset_start, preset_end + 1))
+        return await _preset_scan(presets, progress_callback=progress_callback)
