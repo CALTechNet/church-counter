@@ -386,7 +386,7 @@ async def _preset_scan(
     # Go to first preset and wait for camera to settle
     await prog(f"Moving to first preset {presets[0]}…", 0)
     await call_preset(presets[0])
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(3.0)
 
     # Capture frames during the settle window at first preset
     f = await asyncio.to_thread(capture_frame)
@@ -394,10 +394,11 @@ async def _preset_scan(
         frames.append(f)
     await prog(f"Preset {presets[0]} (1/{total}) — {len(frames)} total", 0)
 
-    # Move through remaining presets; capture one frame after each move
+    # Move through remaining presets; wait 100ms after each move, then capture
     for i, preset_id in enumerate(presets[1:], 1):
         pct = int((i / total) * 88)
         await call_preset(preset_id)
+        await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
@@ -478,7 +479,7 @@ async def _calibrated_scan(
     await prog(f"Moving to top-left (pan={pan0}, tilt={tilt0}) and zooming to {zoom}…", 0)
     await move_abs(pan0, tilt0)
     await zoom_abs(zoom)
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(3.0)
 
     # Capture frames during the settle window at top-left
     f = await asyncio.to_thread(capture_frame)
@@ -486,10 +487,11 @@ async def _calibrated_scan(
         frames.append(f)
     await prog(f"Position 1/{total} (pan={pan0}, tilt={tilt0}) — {len(frames)} total", 0)
 
-    # Move through remaining positions; capture one frame after each move
+    # Move through remaining positions; wait 100ms after each move, then capture
     for i, (pan, tilt) in enumerate(positions[1:], 1):
         pct = int((i / total) * 88)
         await move_abs(pan, tilt)
+        await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
