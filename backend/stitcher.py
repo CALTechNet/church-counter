@@ -730,6 +730,7 @@ def _stitch_strip(
     frames: List[np.ndarray],
     direction: str = "horizontal",
     positions: Optional[List[Tuple[float, float]]] = None,
+    translation_only: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Stitch a list of frames that overlap in the given direction.
@@ -738,6 +739,12 @@ def _stitch_strip(
     When *positions* (list of (pan, tilt) per frame) is provided, expected
     pixel offsets are computed from the known camera geometry and used to
     validate matches and as a better fallback than the generic 85 % guess.
+
+    When *translation_only* is True, rotation/scale/shear components are
+    stripped from each pairwise transform before chaining.  This prevents
+    accumulated affine drift that causes barrel distortion at panorama edges
+    — appropriate for PTZ cameras where adjacent frames differ only by
+    pan/tilt (pure translation in image space).
     """
     if not frames:
         return None
@@ -759,6 +766,16 @@ def _stitch_strip(
         )
         if failed:
             logger.warning(f"  Strip pair {i}->{i+1}: fallback ({direction})")
+
+        if translation_only:
+            # Keep only translation (dx, dy), discard rotation/scale/shear.
+            # PTZ cameras at fixed zoom produce pure-translation offsets;
+            # allowing affine components to accumulate causes edge warping.
+            H_trans = np.eye(3, dtype=np.float64)
+            H_trans[0, 2] = H[0, 2]
+            H_trans[1, 2] = H[1, 2]
+            H = H_trans
+
         pairwise.append(H)
 
     del enhanced
@@ -879,7 +896,7 @@ def _stitch_grid(
             logger.warning(f"  Row {r}: no frames, skipping")
             continue
         logger.info(f"  Row {r}: stitching {len(row_frames)} frames horizontally")
-        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos)
+        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos, translation_only=True)
         if strip is not None:
             row_strips.append(strip)
             # For vertical stitching, use the mean position of each row
@@ -897,7 +914,7 @@ def _stitch_grid(
     # Stitch row strips vertically
     logger.info(f"Stitching {len(row_strips)} row strips vertically...")
     vert_pos = row_strip_positions if len(row_strip_positions) == len(row_strips) else None
-    panorama = _stitch_strip(row_strips, direction="vertical", positions=vert_pos)
+    panorama = _stitch_strip(row_strips, direction="vertical", positions=vert_pos, translation_only=True)
 
     if panorama is None:
         return None, "no_frames"
