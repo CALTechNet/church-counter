@@ -627,16 +627,14 @@ async def _calibrated_scan(
     zoom = int(bounds.get("zoom") or 10000)
     zoom = max(1, zoom)
 
-    # Step size derived from two calibrated data points:
-    #   zoom=10000 → step=75,  zoom=5000 → step=200
-    # Fitting step = a/zoom + b gives a=1_250_000, b=-50
-    # i.e.  step = 1_250_000 / zoom - 50  (minimum 25)
+    # Step size: at zoom=10000 → step=100, zoom=5000 → step=200
+    # i.e.  step = 1_000_000 / zoom  (minimum 25)
     #
     # Tilt step is 65% of pan step: ceiling-mounted cameras see more
     # perspective distortion per degree of tilt than pan, so we need
     # denser vertical overlap to prevent the stitcher from scaling
     # frames to match features across tilt transitions.
-    pan_step  = max(25, int(1_250_000 / zoom) - 50)
+    pan_step  = max(25, int(1_000_000 / zoom))
     tilt_step = max(25, int(pan_step * 0.65))
     pan_range  = abs(pan_br  - pan_tl)
     tilt_range = abs(tilt_br - tilt_tl)
