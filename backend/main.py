@@ -147,13 +147,8 @@ async def run_scan(service_type: str = "Manual", room_id: str = None):
         else:
             await _progress("Stitching panorama…", 93)
             scan_mode = room.get("scan_mode", "preset")
-            # Load lens distortion coefficients from camera bounds
-            _bounds = db.get_config("camera_bounds", {})
-            _lens_k1 = float(_bounds.get("lens_k1") or -0.32)
-            _lens_k2 = float(_bounds.get("lens_k2") or 0.12)
             panorama, stitch_status = stitch.stitch_frames(
                 frames, grid_shape=grid_shape, positions=positions, scan_mode=scan_mode,
-                lens_k1=_lens_k1, lens_k2=_lens_k2,
             )
             if panorama is None:
                 raise RuntimeError("Panorama stitching failed")
@@ -530,13 +525,11 @@ async def api_save_settings(body: AppSettings):
 
 # ── Camera bounds (individual pan/tilt edges + scan zoom) ─────────────────────
 class CameraBounds(BaseModel):
-    left:   Optional[int] = None     # pan value for left edge
-    right:  Optional[int] = None     # pan value for right edge
-    top:    Optional[int] = None     # tilt value for top edge
-    bottom: Optional[int] = None     # tilt value for bottom edge
-    zoom:   Optional[int] = None     # scan zoom level
-    lens_k1: Optional[float] = None  # radial distortion coefficient k1
-    lens_k2: Optional[float] = None  # radial distortion coefficient k2
+    left:   Optional[int] = None   # pan value for left edge
+    right:  Optional[int] = None   # pan value for right edge
+    top:    Optional[int] = None   # tilt value for top edge
+    bottom: Optional[int] = None   # tilt value for bottom edge
+    zoom:   Optional[int] = None   # scan zoom level
 
 
 def _compute_corners(bounds: dict) -> dict:

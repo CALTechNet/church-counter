@@ -1024,8 +1024,6 @@ def stitch_frames(
     grid_shape: Optional[Tuple[int, int]] = None,
     positions: Optional[List[Tuple[float, float]]] = None,
     scan_mode: Optional[str] = None,
-    lens_k1: float = -0.32,
-    lens_k2: float = 0.12,
 ) -> Tuple[Optional[np.ndarray], str]:
     """
     Stitch a sequence of overlapping frames into a single panorama.
@@ -1035,9 +1033,8 @@ def stitch_frames(
       - "calibrated"→ Grid-aware affine stitching with position guidance
       - None        → auto-select based on whether grid_shape is provided
 
-    *lens_k1* / *lens_k2* are radial distortion coefficients passed to
-    ``undistort_frame()`` to correct barrel/pincushion distortion before
-    stitching.  Set both to 0.0 to disable lens correction.
+    Barrel / pincushion lens distortion is automatically corrected on
+    each frame before stitching (via ``undistort_frame``).
 
     Returns (panorama_image, status_string).
     """
@@ -1047,10 +1044,9 @@ def stitch_frames(
     if len(frames) == 1:
         return frames[0], "single_frame"
 
-    # --- Lens distortion correction ---
-    if lens_k1 != 0.0 or lens_k2 != 0.0:
-        logger.info(f"Applying lens undistortion (k1={lens_k1}, k2={lens_k2}) to {len(frames)} frames")
-        frames = [undistort_frame(f, k1=lens_k1, k2=lens_k2) for f in frames]
+    # --- Automatic lens distortion correction ---
+    logger.info(f"Applying lens undistortion to {len(frames)} frames")
+    frames = [undistort_frame(f) for f in frames]
 
     # Route to the correct algorithm based on scan mode
     if scan_mode == "preset":

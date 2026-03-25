@@ -35,10 +35,6 @@ export default function CalibrationWizard({ onClose }) {
   const [bottomTilt, setBottomTilt] = useState(null)
   const [scanZoom,   setScanZoom]   = useState(null)
 
-  // Lens distortion correction
-  const [lensK1, setLensK1] = useState(-0.32)
-  const [lensK2, setLensK2] = useState(0.12)
-
   const [saving, setSaving]         = useState(false)
   const [saved, setSaved]           = useState(false)
   const [status, setStatus]         = useState('')
@@ -114,8 +110,6 @@ export default function CalibrationWizard({ onClose }) {
       if (b.top    != null) setTopTilt(b.top)
       if (b.bottom != null) setBottomTilt(b.bottom)
       if (b.zoom   != null) setScanZoom(b.zoom)
-      if (b.lens_k1 != null) setLensK1(b.lens_k1)
-      if (b.lens_k2 != null) setLensK2(b.lens_k2)
     }).catch(() => {})
   }, [])
 
@@ -175,8 +169,6 @@ export default function CalibrationWizard({ onClose }) {
         top:    topTilt,
         bottom: bottomTilt,
         zoom:   scanZoom,
-        lens_k1: lensK1,
-        lens_k2: lensK2,
       })
       setSaved(true)
       setStatus('Bounds saved!')
@@ -318,49 +310,6 @@ export default function CalibrationWizard({ onClose }) {
                 Set Zoom
               </button>
               <NumericInput label="Zoom" color={C.yellow} value={scanZoom} min={0} max={65535} onChange={v => { setScanZoom(v); setStatus(`Scan zoom set to ${v}.`) }} />
-            </Section>
-
-            <Divider />
-
-            {/* Lens Distortion Correction */}
-            <Section label="Lens Correction">
-              <div style={{ fontSize: 9, color: C.muted, marginBottom: 2 }}>
-                Corrects barrel distortion (camera curve). Negative k1 fixes barrel, positive fixes pincushion. Set both to 0 to disable.
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <label style={{ fontSize: 10, color: C.muted, width: 24, flexShrink: 0 }}>k1</label>
-                  <input
-                    type="range" min="-1" max="1" step="0.01" value={lensK1}
-                    onChange={e => setLensK1(parseFloat(e.target.value))}
-                    style={{ flex: 1, accentColor: C.accent }}
-                  />
-                  <input
-                    type="number" step="0.01" value={lensK1}
-                    onChange={e => setLensK1(parseFloat(e.target.value) || 0)}
-                    style={{ width: 54, background: C.bg, border: `1px solid ${C.border}`, color: C.text, borderRadius: 4, padding: '2px 4px', fontSize: 11, textAlign: 'center' }}
-                  />
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <label style={{ fontSize: 10, color: C.muted, width: 24, flexShrink: 0 }}>k2</label>
-                  <input
-                    type="range" min="-0.5" max="0.5" step="0.01" value={lensK2}
-                    onChange={e => setLensK2(parseFloat(e.target.value))}
-                    style={{ flex: 1, accentColor: C.accent }}
-                  />
-                  <input
-                    type="number" step="0.01" value={lensK2}
-                    onChange={e => setLensK2(parseFloat(e.target.value) || 0)}
-                    style={{ width: 54, background: C.bg, border: `1px solid ${C.border}`, color: C.text, borderRadius: 4, padding: '2px 4px', fontSize: 11, textAlign: 'center' }}
-                  />
-                </div>
-                <button
-                  onClick={() => { setLensK1(-0.32); setLensK2(0.12); setStatus('Lens correction reset to defaults.') }}
-                  style={{ background: 'transparent', border: `1px solid ${C.border}`, color: C.muted, borderRadius: 4, padding: '3px 8px', fontSize: 10, cursor: 'pointer' }}
-                >
-                  Reset to defaults
-                </button>
-              </div>
             </Section>
 
             <Divider />
