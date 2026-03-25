@@ -588,7 +588,7 @@ async def _calibrated_scan(
     progress_callback: Optional[ProgressCB] = None,
     cancel_event=None,
     camera_ip: str = None,
-) -> List[np.ndarray]:
+) -> Tuple[List[np.ndarray], Tuple[int, int], List[Tuple[int, int]]]:
     """
     Move camera through a grid of absolute PTZ positions between the saved
     top-left and bottom-right bounds, capturing frames at each stop.
@@ -672,7 +672,7 @@ async def _calibrated_scan(
     await prog(f"Starting calibrated scan ({rows}×{cols} grid, {total} positions)…", 0)
 
     if not positions:
-        return frames
+        return frames, (rows, cols), []
 
     # Go to top-left (first position), zoom to saved level, and verify arrival
     pan0, tilt0 = positions[0]
@@ -687,7 +687,7 @@ async def _calibrated_scan(
     await asyncio.sleep(0.075)
 
     if cancelled():
-        return frames
+        return frames, (rows, cols), positions
 
     # Capture frame at first position
     f = await asyncio.to_thread(capture_frame)
@@ -698,7 +698,7 @@ async def _calibrated_scan(
     # Move through remaining positions with position verification
     for i, (pan, tilt) in enumerate(positions[1:], 1):
         if cancelled():
-            return frames
+            return frames, (rows, cols), positions
         pct = int((i / total) * 88)
         await move_abs(pan, tilt, pan_speed=24, tilt_speed=20)
         await _await_position(
@@ -722,16 +722,17 @@ async def _calibrated_scan(
     await go_home()
     await prog(f"Capture complete — {len(frames)} frames", 92)
     logger.info(f"_calibrated_scan done: {len(frames)} frames across {total} positions ({rows}r × {cols}c grid)")
-    return frames, (rows, cols)
+    return frames, (rows, cols), positions
 
 
-async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event=None, room_config: dict = None) -> Tuple[List[np.ndarray], Optional[Tuple[int, int]]]:
+async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event=None, room_config: dict = None) -> Tuple[List[np.ndarray], Optional[Tuple[int, int]], Optional[list]]:
     """
     Dispatch to either preset or calibrated scan based on saved app settings,
     or use room_config if provided to determine camera type and settings.
 
-    Returns (frames, grid_shape) where grid_shape is (rows, cols) for
-    calibrated scans or None for preset/RTSP scans.
+    Returns (frames, grid_shape, positions) where:
+      - grid_shape is (rows, cols) for grid scans or None for RTSP
+      - positions is a list of (pan, tilt) tuples for calibrated scans, else None
     """
     import database as db
 
@@ -744,49 +745,58 @@ async def auto_scan(progress_callback: Optional[ProgressCB] = None, cancel_event
             rtsp_url = room_config.get("rtsp_url", "")
             if not rtsp_url:
                 logger.error("No RTSP URL configured for room")
-                return [], None
+                return [], None, None
             if progress_callback:
                 await progress_callback("Capturing RTSP frame…", 10)
             frame = await asyncio.to_thread(capture_frame, rtsp_url)
             if frame is None:
                 logger.error(f"Failed to capture frame from RTSP URL: {rtsp_url}")
-                return [], None
+                return [], None, None
             if progress_callback:
                 await progress_callback("Frame captured", 90)
-            return [frame], None
+            return [frame], None, None
 
         # PTZ Optics: use room-specific settings
         mode = room_config.get("scan_mode", "preset")
         if mode == "calibrated":
-            return await _calibrated_scan(
+            frames, grid_shape, positions = await _calibrated_scan(
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 camera_ip=room_config.get("camera_ip"),
             )
+            return frames, grid_shape, positions
         else:
             preset_start = int(room_config.get("preset_start", 100))
             preset_end   = int(room_config.get("preset_end", 131))
             presets = list(range(preset_start, preset_end + 1))
             p_cols = room_config.get("preset_cols")
             p_cols = int(p_cols) if p_cols else None
-            return await _preset_scan(
+            frames, grid_shape = await _preset_scan(
                 presets,
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
                 camera_ip=room_config.get("camera_ip"),
                 preset_cols=p_cols,
             )
+            return frames, grid_shape, None
 
     # Fallback: use global settings (backward compat)
     settings = db.get_config("app_settings", {})
     mode = settings.get("scan_mode", "preset")
 
     if mode == "calibrated":
-        return await _calibrated_scan(progress_callback=progress_callback, cancel_event=cancel_event)
+        frames, grid_shape, positions = await _calibrated_scan(
+            progress_callback=progress_callback, cancel_event=cancel_event,
+        )
+        return frames, grid_shape, positions
     else:
         preset_start = int(settings.get("preset_start", 100))
         preset_end   = int(settings.get("preset_end",   131))
         presets = list(range(preset_start, preset_end + 1))
         p_cols = settings.get("preset_cols")
         p_cols = int(p_cols) if p_cols else None
-        return await _preset_scan(presets, progress_callback=progress_callback, cancel_event=cancel_event, preset_cols=p_cols)
+        frames, grid_shape = await _preset_scan(
+            presets, progress_callback=progress_callback,
+            cancel_event=cancel_event, preset_cols=p_cols,
+        )
+        return frames, grid_shape, None

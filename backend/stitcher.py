@@ -70,6 +70,7 @@ _ORB_FEATURES  = 3000
 _MATCH_RATIO   = 0.75
 _RANSAC_REPROJ = 5.0
 _MIN_INLIERS   = 10
+_PHASE_CORR_MIN = 0.05          # minimum phase-correlation response to accept
 
 
 def _estimate_affine(
@@ -187,6 +188,57 @@ def _template_affine(
     return H
 
 
+def _phase_correlation_affine(
+    frame_a: np.ndarray,
+    frame_b: np.ndarray,
+    direction: str = "horizontal",
+) -> Optional[np.ndarray]:
+    """Translation-only matching via phase correlation.
+
+    Phase correlation uses the global frequency content of the overlap region,
+    making it far more robust than local feature matching on dark, repetitive
+    textures (e.g. rows of identical chairs in a dim church).
+    """
+    gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+    # Match dimensions
+    h = min(gray_a.shape[0], gray_b.shape[0])
+    w = min(gray_a.shape[1], gray_b.shape[1])
+    gray_a = gray_a[:h, :w]
+    gray_b = gray_b[:h, :w]
+
+    # Hann window to suppress edge artifacts in FFT
+    window = cv2.createHanningWindow((w, h), cv2.CV_64F)
+    gray_a = gray_a * window
+    gray_b = gray_b * window
+
+    shift, response = cv2.phaseCorrelate(gray_a, gray_b)
+
+    if response < _PHASE_CORR_MIN:
+        return None
+
+    dx, dy = shift
+
+    # Sanity: for horizontal stitching, dx should be significant and positive
+    # For vertical stitching, dy should be significant and positive
+    if direction == "horizontal":
+        if abs(dx) < w * 0.05:      # too small — likely a phantom peak
+            return None
+    else:
+        if abs(dy) < h * 0.05:
+            return None
+
+    H = np.eye(3, dtype=np.float64)
+    H[0, 2] = dx
+    H[1, 2] = dy
+
+    logger.debug(
+        f"Phase correlation: dx={dx:.1f} dy={dy:.1f} response={response:.4f}"
+    )
+    return H
+
+
 # ---------------------------------------------------------------------------
 # Affine validation
 # ---------------------------------------------------------------------------
@@ -256,38 +308,102 @@ def _hist(frame: np.ndarray) -> np.ndarray:
 # Pairwise affine with fallbacks (used for both row and column stitching)
 # ---------------------------------------------------------------------------
 
+def _direction_ok(
+    H: np.ndarray,
+    direction: str,
+    frame_shape: Tuple[int, ...],
+) -> bool:
+    """Check that the dominant translation axis matches the expected direction."""
+    dx, dy = abs(H[0, 2]), abs(H[1, 2])
+    h, w = frame_shape[:2]
+    if direction == "horizontal":
+        # dx should be the dominant component and at least 10% of frame width
+        return dx > w * 0.10 and dx > dy * 0.5
+    else:
+        return dy > h * 0.10 and dy > dx * 0.5
+
+
 def _match_pair(
     frame_a: np.ndarray,
     frame_b: np.ndarray,
     enhanced_a: np.ndarray,
     enhanced_b: np.ndarray,
     fallback_direction: str = "horizontal",
+    expected_offset: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Optional[np.ndarray], bool]:
     """
     Try to match a pair of frames.  Returns (H, used_fallback).
     fallback_direction controls the last-resort translation guess:
       "horizontal" → shift right by 85% of frame width
       "vertical"   → shift down by 85% of frame height
+
+    When expected_offset=(dx, dy) is provided (from known camera positions),
+    it is used to validate matches and as a better final fallback.
     """
+    candidates: list = []
+
+    # 1. ORB on enhanced frames
     H = _estimate_affine(enhanced_a, enhanced_b)
     if H is not None and not _is_valid_affine(H, frame_b.shape):
         H = None
-    if H is None:
-        H = _template_affine(enhanced_a, enhanced_b)
-    if H is None:
+    if H is not None and _direction_ok(H, fallback_direction, frame_b.shape):
+        candidates.append(("orb_enhanced", H))
+
+    # 2. Template matching on enhanced frames
+    H = _template_affine(enhanced_a, enhanced_b)
+    if H is not None and _direction_ok(H, fallback_direction, frame_b.shape):
+        candidates.append(("template_enhanced", H))
+
+    # 3. Phase correlation (very robust for repetitive textures)
+    H = _phase_correlation_affine(frame_a, frame_b, direction=fallback_direction)
+    if H is not None:
+        candidates.append(("phase_corr", H))
+
+    # 4. ORB on raw frames
+    if not candidates:
         H = _estimate_affine(frame_a, frame_b)
         if H is not None and not _is_valid_affine(H, frame_b.shape):
             H = None
-    if H is None:
+        if H is not None and _direction_ok(H, fallback_direction, frame_b.shape):
+            candidates.append(("orb_raw", H))
+
+    # 5. Template matching on raw frames
+    if not candidates:
         H = _template_affine(frame_a, frame_b)
+        if H is not None and _direction_ok(H, fallback_direction, frame_b.shape):
+            candidates.append(("template_raw", H))
 
-    if H is not None:
-        return H, False
+    # If we have an expected offset, pick the candidate closest to it
+    if expected_offset is not None and candidates:
+        ex_dx, ex_dy = expected_offset
 
-    # Last resort: translation guess
+        def offset_err(name_h):
+            _, h_mat = name_h
+            return abs(h_mat[0, 2] - ex_dx) + abs(h_mat[1, 2] - ex_dy)
+
+        best_name, best_H = min(candidates, key=offset_err)
+        logger.debug(
+            f"  Best match: {best_name} "
+            f"(dx={best_H[0,2]:.0f}, dy={best_H[1,2]:.0f}; "
+            f"expected dx={ex_dx:.0f}, dy={ex_dy:.0f})"
+        )
+        return best_H, False
+    elif candidates:
+        # No expected offset — prefer the first (highest-priority) candidate
+        best_name, best_H = candidates[0]
+        logger.debug(f"  Best match: {best_name} (dx={best_H[0,2]:.0f}, dy={best_H[1,2]:.0f})")
+        return best_H, False
+
+    # Last resort: use expected offset if available, else generic guess
     h, w = frame_a.shape[:2]
     H = np.eye(3, dtype=np.float64)
-    if fallback_direction == "vertical":
+    if expected_offset is not None:
+        H[0, 2], H[1, 2] = expected_offset
+        logger.warning(
+            f"  All matching failed — using expected offset "
+            f"(dx={expected_offset[0]:.0f}, dy={expected_offset[1]:.0f})"
+        )
+    elif fallback_direction == "vertical":
         overlap_guess = int(h * 0.15)
         H[1, 2] = h - overlap_guess
     else:
@@ -549,13 +665,69 @@ def _stitch_sequential(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], 
 # Strip stitching helper (stitch a 1D list of overlapping frames)
 # ---------------------------------------------------------------------------
 
+def _estimate_expected_offsets(
+    positions: Optional[List[Tuple[float, float]]],
+    frames: List[np.ndarray],
+    direction: str,
+) -> List[Optional[Tuple[float, float]]]:
+    """Compute expected pixel offsets between consecutive frames from
+    known pan/tilt positions.
+
+    Returns a list of (dx, dy) tuples, one per consecutive pair.
+    If positions are not available, returns a list of Nones.
+
+    The conversion from pan/tilt units to pixels is estimated by assuming
+    the total position range maps to roughly ``(1 - overlap) * n_frames``
+    frame widths/heights, with ~35 % overlap.
+    """
+    n = len(frames)
+    if positions is None or len(positions) != n:
+        return [None] * max(0, n - 1)
+
+    h, w = frames[0].shape[:2]
+    overlap = 0.35
+
+    if direction == "horizontal":
+        # Compute pan range
+        pans = [p[0] for p in positions]
+        pan_range = max(pans) - min(pans)
+        if pan_range < 1:
+            return [None] * (n - 1)
+        # Total panorama width in pixels ≈ n columns with overlap
+        pixels_per_pan = (w * (1 - overlap)) * (n - 1) / pan_range if pan_range else 1
+        offsets = []
+        for i in range(n - 1):
+            dp = positions[i + 1][0] - positions[i][0]
+            dt = positions[i + 1][1] - positions[i][1]
+            offsets.append((dp * pixels_per_pan, dt * pixels_per_pan))
+        return offsets
+    else:
+        # Compute tilt range
+        tilts = [p[1] for p in positions]
+        tilt_range = max(tilts) - min(tilts)
+        if tilt_range < 1:
+            return [None] * (n - 1)
+        pixels_per_tilt = (h * (1 - overlap)) * (n - 1) / tilt_range if tilt_range else 1
+        offsets = []
+        for i in range(n - 1):
+            dp = positions[i + 1][0] - positions[i][0]
+            dt = positions[i + 1][1] - positions[i][1]
+            offsets.append((dp * pixels_per_tilt, dt * pixels_per_tilt))
+        return offsets
+
+
 def _stitch_strip(
     frames: List[np.ndarray],
     direction: str = "horizontal",
+    positions: Optional[List[Tuple[float, float]]] = None,
 ) -> Optional[np.ndarray]:
     """
     Stitch a list of frames that overlap in the given direction.
     Returns a single composited image, or None if empty.
+
+    When *positions* (list of (pan, tilt) per frame) is provided, expected
+    pixel offsets are computed from the known camera geometry and used to
+    validate matches and as a better fallback than the generic 85 % guess.
     """
     if not frames:
         return None
@@ -565,12 +737,15 @@ def _stitch_strip(
     n = len(frames)
     enhanced = [enhance_frame(f) for f in frames]
 
+    expected_offsets = _estimate_expected_offsets(positions, frames, direction)
+
     pairwise: List[np.ndarray] = []
     for i in range(n - 1):
         H, failed = _match_pair(
             frames[i], frames[i + 1],
             enhanced[i], enhanced[i + 1],
             fallback_direction=direction,
+            expected_offset=expected_offsets[i],
         )
         if failed:
             logger.warning(f"  Strip pair {i}->{i+1}: fallback ({direction})")
@@ -629,24 +804,52 @@ def _arrange_boustrophedon(
     return grid
 
 
+def _arrange_boustrophedon_positions(
+    positions: List[Tuple[float, float]],
+    rows: int,
+    cols: int,
+) -> List[List[Optional[Tuple[float, float]]]]:
+    """Arrange positions into the same 2D grid as frames (mirrors _arrange_boustrophedon)."""
+    grid: List[List[Optional[Tuple[float, float]]]] = [
+        [None] * cols for _ in range(rows)
+    ]
+    idx = 0
+    for col in range(cols):
+        for row_idx in range(rows):
+            if idx >= len(positions):
+                break
+            if col % 2 == 0:
+                actual_row = row_idx
+            else:
+                actual_row = rows - 1 - row_idx
+            grid[actual_row][col] = positions[idx]
+            idx += 1
+    return grid
+
+
 def _stitch_grid(
     frames: List[np.ndarray],
     rows: int,
     cols: int,
+    positions: Optional[List[Tuple[float, float]]] = None,
 ) -> Tuple[Optional[np.ndarray], str]:
     """
     Grid-aware stitching: arrange frames into a 2D grid, stitch each row
     horizontally, then stitch the resulting row-strips vertically.
+
+    When *positions* (flat list of (pan, tilt) in scan order) is provided,
+    the known camera geometry is used to compute expected pixel offsets,
+    dramatically improving alignment on dark / repetitive scenes.
     """
     logger.info(f"Grid-aware stitch: {rows} rows x {cols} cols, {len(frames)} frames")
 
-    # Deduplicate before arranging — but we need to be careful not to
-    # remove frames that look similar but are at different positions.
-    # With grid-aware stitching, we skip deduplication since we know
-    # exactly where each frame belongs.
-
     # Arrange into grid
     grid = _arrange_boustrophedon(frames, rows, cols)
+
+    pos_grid = None
+    if positions is not None and len(positions) == len(frames):
+        pos_grid = _arrange_boustrophedon_positions(positions, rows, cols)
+        logger.info("Using known camera positions for alignment guidance")
 
     # Log grid occupancy
     for r in range(rows):
@@ -656,15 +859,24 @@ def _stitch_grid(
     # Stitch each row horizontally
     logger.info("Stitching rows horizontally...")
     row_strips: List[np.ndarray] = []
+    row_strip_positions: List[Optional[Tuple[float, float]]] = []
     for r in range(rows):
         row_frames = [grid[r][c] for c in range(cols) if grid[r][c] is not None]
+        row_pos = None
+        if pos_grid is not None:
+            row_pos = [pos_grid[r][c] for c in range(cols) if grid[r][c] is not None]
         if not row_frames:
             logger.warning(f"  Row {r}: no frames, skipping")
             continue
         logger.info(f"  Row {r}: stitching {len(row_frames)} frames horizontally")
-        strip = _stitch_strip(row_frames, direction="horizontal")
+        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos)
         if strip is not None:
             row_strips.append(strip)
+            # For vertical stitching, use the mean position of each row
+            if row_pos:
+                mean_pan = np.mean([p[0] for p in row_pos])
+                mean_tilt = np.mean([p[1] for p in row_pos])
+                row_strip_positions.append((mean_pan, mean_tilt))
         gc.collect()
 
     if not row_strips:
@@ -674,7 +886,8 @@ def _stitch_grid(
 
     # Stitch row strips vertically
     logger.info(f"Stitching {len(row_strips)} row strips vertically...")
-    panorama = _stitch_strip(row_strips, direction="vertical")
+    vert_pos = row_strip_positions if len(row_strip_positions) == len(row_strips) else None
+    panorama = _stitch_strip(row_strips, direction="vertical", positions=vert_pos)
 
     if panorama is None:
         return None, "no_frames"
@@ -691,6 +904,7 @@ def _stitch_grid(
 def stitch_frames(
     frames: List[np.ndarray],
     grid_shape: Optional[Tuple[int, int]] = None,
+    positions: Optional[List[Tuple[float, float]]] = None,
 ) -> Tuple[Optional[np.ndarray], str]:
     """
     Stitch a sequence of overlapping frames into a single panorama.
@@ -698,6 +912,10 @@ def stitch_frames(
     When grid_shape=(rows, cols) is provided, uses grid-aware stitching
     that properly handles the boustrophedon scan pattern by stitching
     rows first, then stacking vertically.
+
+    When *positions* (list of (pan, tilt) per frame in scan order) is
+    provided alongside grid_shape, the known camera geometry guides
+    alignment — reducing ghosting on dark / repetitive scenes.
 
     When grid_shape is None, falls back to sequential chain stitching.
 
@@ -712,7 +930,7 @@ def stitch_frames(
     if grid_shape is not None:
         rows, cols = grid_shape
         if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
-            panorama, status = _stitch_grid(frames, rows, cols)
+            panorama, status = _stitch_grid(frames, rows, cols, positions=positions)
         else:
             logger.warning(
                 f"Grid shape {grid_shape} doesn't match frame count "
