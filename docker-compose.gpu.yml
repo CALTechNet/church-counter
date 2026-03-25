@@ -1,0 +1,37 @@
+
+version: "3.9"
+
+services:
+  attendance:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    container_name: church-attendance
+    restart: unless-stopped
+    ports:
+      - "80:8000"
+    volumes:
+      - ./data:/data          # SQLite database — persists between restarts
+      - ./config:/config      # Drop your seats.svg here
+      - ./models:/models      # Persisted YOLO model weights (incl. OpenVINO export)
+    mem_limit: 12g
+    memswap_limit: 12g
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Chicago
+      # GPU-optimized: larger batch size since GPU handles parallel tiles efficiently
+      # and 32 GB host RAM + 8 GB VRAM can handle bigger batches
+      - TILE_BATCH_SIZE=16
+      - YOLO_IMGSZ=640
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    network_mode: bridge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

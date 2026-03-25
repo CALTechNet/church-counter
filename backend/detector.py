@@ -9,9 +9,10 @@ YOLO26x improvements over YOLO11x:
   - ProgLoss: improved small-object recall without increasing model size
   - ~43% faster CPU inference per tile
 
-Performance notes (ENCS5412 / Xeon D / CPU-only):
+Performance notes:
   - All tiles are batched into a single YOLO call to minimise Python/PyTorch overhead
-  - For further speedup, export to OpenVINO with export_openvino.sh (2-4x on Intel CPUs)
+  - GPU acceleration is auto-detected: if CUDA is available, inference runs on GPU
+  - For CPU-only hosts, export to OpenVINO with export_openvino.sh (2-4x on Intel CPUs)
     then set YOLO_MODEL=/models/yolo26x_openvino_model in docker-compose.yml
   - Cross-tile NMS deduplication is still applied after merging all tile results
 """
@@ -22,10 +23,27 @@ from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
 _model = None
+_device = None
+
+
+def detect_gpu() -> str:
+    """Auto-detect the best available compute device.
+    Returns 'cuda', 'cuda:0', etc. if a GPU is available, otherwise 'cpu'.
+    Logs detailed GPU info when available.
+    """
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_mb = torch.cuda.get_device_properties(0).total_mem / 1024 / 1024
+        logger.info(f"GPU detected: {gpu_name} ({vram_mb:.0f} MB VRAM)")
+        logger.info(f"CUDA version: {torch.version.cuda}")
+        return "cuda"
+    logger.info("No GPU detected — running inference on CPU")
+    return "cpu"
 
 # ── Tiling config ─────────────────────────────────────────────────────────────
 TILE_COLS    = 10    # number of columns to split panorama into
@@ -44,12 +62,18 @@ YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "640"))
 
 
 def _get_model():
-    global _model
+    global _model, _device
     if _model is None:
         from ultralytics import YOLO
+        _device = detect_gpu()
         model_name = os.getenv("YOLO_MODEL", "yolo26x.pt")
         _model = YOLO(model_name)
-        logger.info(f"YOLO model loaded: {model_name}")
+        # Move model to GPU if available
+        if _device == "cuda":
+            _model.to(_device)
+            logger.info(f"YOLO model loaded on GPU: {model_name}")
+        else:
+            logger.info(f"YOLO model loaded on CPU: {model_name}")
     return _model
 
 
@@ -161,6 +185,7 @@ def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
             classes=[0],
             conf=confidence,
             imgsz=YOLO_IMGSZ,
+            device=_device,
             verbose=False,
         )
 
