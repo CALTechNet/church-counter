@@ -538,8 +538,6 @@ async def _preset_scan(
         )
     else:
         await asyncio.sleep(3.0)
-    # Brief settle after arriving
-    await asyncio.sleep(0.1)
 
     if cancelled():
         return frames, grid_shape
@@ -564,8 +562,6 @@ async def _preset_scan(
             )
         else:
             await asyncio.sleep(TRAVEL_TIME)
-        # Brief settle for vibration damping
-        await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
@@ -627,16 +623,14 @@ async def _calibrated_scan(
     zoom = int(bounds.get("zoom") or 10000)
     zoom = max(1, zoom)
 
-    # Step size derived from two calibrated data points:
-    #   zoom=10000 → step=75,  zoom=5000 → step=200
-    # Fitting step = a/zoom + b gives a=1_250_000, b=-50
-    # i.e.  step = 1_250_000 / zoom - 50  (minimum 25)
+    # Step size: at zoom=10000 → step=100, zoom=5000 → step=200
+    # i.e.  step = 1_000_000 / zoom  (minimum 25)
     #
     # Tilt step is 65% of pan step: ceiling-mounted cameras see more
     # perspective distortion per degree of tilt than pan, so we need
     # denser vertical overlap to prevent the stitcher from scaling
     # frames to match features across tilt transitions.
-    pan_step  = max(25, int(1_250_000 / zoom) - 50)
+    pan_step  = max(25, int(1_000_000 / zoom))
     tilt_step = max(25, int(pan_step * 0.65))
     pan_range  = abs(pan_br  - pan_tl)
     tilt_range = abs(tilt_br - tilt_tl)
@@ -687,9 +681,6 @@ async def _calibrated_scan(
         pan0, tilt0,
         lambda: move_abs(pan0, tilt0),
     )
-    # Brief settle for vibration damping
-    await asyncio.sleep(0.075)
-
     if cancelled():
         return frames, (rows, cols), positions
 
@@ -709,8 +700,6 @@ async def _calibrated_scan(
             pan, tilt,
             lambda p=pan, t=tilt: move_abs(p, t, pan_speed=24, tilt_speed=20),
         )
-        # Brief settle for vibration damping
-        await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
