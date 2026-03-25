@@ -4,6 +4,7 @@ FastAPI + APScheduler, single container.
 """
 import asyncio
 import logging
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +74,32 @@ async def _progress(msg: str, pct: int):
     await _broadcast({"type": "progress", "message": msg, "progress": pct})
 
 
+def _estimate_scan_positions(room: dict) -> int:
+    """Estimate the total number of capture positions for a room's scan config."""
+    camera_type = room.get("camera_type", "ptz_optics")
+    if camera_type == "rtsp":
+        return 1
+    scan_mode = room.get("scan_mode", "preset")
+    if scan_mode == "calibrated":
+        bounds = db.get_config("camera_bounds", {})
+        left = bounds.get("left") or (bounds.get("top_left", {}) or {}).get("pan")
+        right = bounds.get("right") or (bounds.get("bottom_right", {}) or {}).get("pan")
+        top = bounds.get("top") or (bounds.get("top_left", {}) or {}).get("tilt")
+        bottom = bounds.get("bottom") or (bounds.get("bottom_right", {}) or {}).get("tilt")
+        if None in (left, right, top, bottom):
+            return 24  # fallback
+        zoom = int(bounds.get("zoom") or 10000)
+        pan_step = max(25, int(1_000_000 / zoom))
+        tilt_step = max(25, int(pan_step * 0.65))
+        cols = max(1, math.ceil(abs(int(right) - int(left)) / pan_step) + 1)
+        rows = max(1, math.ceil(abs(int(bottom) - int(top)) / tilt_step) + 1)
+        return rows * cols
+    else:
+        preset_start = int(room.get("preset_start", 100))
+        preset_end = int(room.get("preset_end", 131))
+        return preset_end - preset_start + 1
+
+
 async def run_scan(service_type: str = "Manual", room_id: str = None):
     if state["running"]:
         logger.warning("Scan already in progress — ignoring request")
@@ -85,8 +112,9 @@ async def run_scan(service_type: str = "Manual", room_id: str = None):
     room = _get_room(room_id)
     room_name = room.get("name", "Unknown")
     camera_type = room.get("camera_type", "ptz_optics")
+    total_positions = _estimate_scan_positions(room)
 
-    await _broadcast({"type": "scan_started", "service_type": service_type, "room": room_name})
+    await _broadcast({"type": "scan_started", "service_type": service_type, "room": room_name, "total_positions": total_positions})
 
     try:
         import cv2
