@@ -35,6 +35,9 @@ export default function App() {
   const [imageB64, setImageB64]       = useState(null)
   const [rawImageB64, setRawImageB64] = useState(null)
   const [scanStartedAt, setScanStartedAt] = useState(null)
+  const [totalPositions, setTotalPositions] = useState(null)
+  const [processingStartedAt, setProcessingStartedAt] = useState(null)
+  const [now, setNow] = useState(Date.now())
   const [zoomImageB64, setZoomImageB64] = useState(null)
   const [serviceType, setServiceType] = useState('Manual')
   const [showCal, setShowCal]         = useState(false)
@@ -77,12 +80,20 @@ export default function App() {
       ws = createWebSocket(msg => {
         if (msg.type === 'progress') {
           setScanState({ running: true, progress: msg.progress, message: msg.message })
+          // Detect transition to processing phase (camera going home / stitching)
+          if (msg.progress >= 90) {
+            setProcessingStartedAt(prev => prev || Date.now())
+          }
         } else if (msg.type === 'scan_started') {
           setScanState({ running: true, progress: 0, message: 'Starting…' })
           setScanStartedAt(Date.now())
+          setProcessingStartedAt(null)
+          setTotalPositions(msg.total_positions || null)
         } else if (msg.type === 'scan_complete') {
           setScanState({ running: false, progress: 100, message: 'Complete!' })
           setScanStartedAt(null)
+          setProcessingStartedAt(null)
+          setTotalPositions(null)
           setSeatStates(msg.seat_states || {})
           setLatestCount(msg.count)
           setLatestTs(msg.timestamp)
@@ -94,10 +105,14 @@ export default function App() {
         } else if (msg.type === 'scan_cancelled') {
           setScanState({ running: false, progress: 0, message: 'Cancelled' })
           setScanStartedAt(null)
+          setProcessingStartedAt(null)
+          setTotalPositions(null)
           showToast('Scan cancelled', C.yellow)
         } else if (msg.type === 'scan_error') {
           setScanState(s => ({ ...s, running: false, message: `Error: ${msg.error}` }))
           setScanStartedAt(null)
+          setProcessingStartedAt(null)
+          setTotalPositions(null)
           showToast(`Scan error: ${msg.error}`, C.red)
         } else if (msg.type === 'state') {
           setScanState({ running: msg.running, progress: msg.progress, message: msg.message })
@@ -115,6 +130,13 @@ export default function App() {
     connect()
     return () => ws && ws.close()
   }, [])
+
+  // Tick every second during scan for time estimates
+  useEffect(() => {
+    if (!scanState.running) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [scanState.running])
 
   // PTZ position polling — every second
   useEffect(() => {
@@ -249,16 +271,50 @@ export default function App() {
       </header>
 
       {/* Progress bar */}
-      {scanState.running && (
-        <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '6px 24px', display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{ flex: 1, background: C.border, borderRadius: 4, height: 6, overflow: 'hidden' }}>
-            <div style={{ width: `${scanState.progress}%`, height: '100%', background: C.accent, transition: 'width 0.5s', borderRadius: 4 }} />
+      {scanState.running && (() => {
+        const isProcessing = scanState.progress >= 90
+        const formatTime = (secs) => {
+          const m = Math.floor(secs / 60)
+          const s = Math.floor(secs % 60)
+          return m > 0 ? `${m}m ${String(s).padStart(2, '0')}s` : `${s}s`
+        }
+        let timeStr = ''
+        if (scanStartedAt) {
+          if (!isProcessing) {
+            // Capture phase: estimate from elapsed time + progress
+            const elapsed = (now - scanStartedAt) / 1000
+            const pct = Math.max(scanState.progress, 1)
+            const captureTotal = (elapsed / pct) * 88 // time for 0-88%
+            const captureRemaining = Math.max(0, captureTotal - elapsed)
+            timeStr = `~${formatTime(Math.round(captureRemaining + 300))} remaining`
+          } else if (processingStartedAt) {
+            // Processing phase: 5-min countdown
+            const processingElapsed = (now - processingStartedAt) / 1000
+            const remaining = Math.max(0, 300 - processingElapsed)
+            timeStr = `~${formatTime(Math.round(remaining))} remaining`
+          }
+        }
+        const displayMessage = isProcessing && scanState.progress < 100
+          ? 'Scan is processing…'
+          : scanState.message
+        return (
+          <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '6px 24px', display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ flex: 1, background: C.border, borderRadius: 4, height: 6, overflow: 'hidden' }}>
+              <div style={{
+                width: isProcessing ? '100%' : `${scanState.progress}%`,
+                height: '100%',
+                background: isProcessing ? C.yellow : C.accent,
+                transition: 'width 0.5s',
+                borderRadius: 4,
+                ...(isProcessing ? { animation: 'pulse 2s ease-in-out infinite', opacity: 0.8 } : {}),
+              }} />
+            </div>
+            <span style={{ fontSize: 12, color: C.muted, whiteSpace: 'nowrap', minWidth: 220 }}>
+              {displayMessage} {scanState.progress < 90 ? `(${scanState.progress}%)` : ''} {timeStr && `· ${timeStr}`}
+            </span>
           </div>
-          <span style={{ fontSize: 12, color: C.muted, whiteSpace: 'nowrap', minWidth: 180 }}>
-            {scanState.message} ({scanState.progress}%)
-          </span>
-        </div>
-      )}
+        )
+      })()}
 
       {/* Tabs */}
       <nav style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: isMobile ? '0 8px' : '0 24px', display: 'flex', gap: 0 }}>
