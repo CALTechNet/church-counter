@@ -395,25 +395,49 @@ def _match_pair(
       "vertical"   → shift down by 85% of frame height
 
     When expected_offset=(dx, dy) is provided (from known camera positions),
-    it is used to validate matches and as a better final fallback.
+    candidates are only accepted if they are within a tolerance of the
+    expected offset.  This prevents bad feature matches from pulling frames
+    out of alignment — the known camera geometry is trusted as ground truth
+    and feature matching only *refines* within that constraint.
     """
+    h, w = frame_a.shape[:2]
     candidates: list = []
+
+    # Maximum distance (pixels) a feature match can deviate from the
+    # expected offset before it's rejected.  30 % of the frame dimension
+    # along the stitching axis gives enough room for genuine refinement
+    # but rejects wildly wrong matches.
+    if expected_offset is not None:
+        if fallback_direction == "horizontal":
+            max_deviation = w * 0.30
+        else:
+            max_deviation = h * 0.30
+    else:
+        max_deviation = float("inf")
+
+    def _within_tolerance(H_mat):
+        """Check if a candidate transform is close enough to expected offset."""
+        if expected_offset is None:
+            return True
+        ex_dx, ex_dy = expected_offset
+        err = abs(H_mat[0, 2] - ex_dx) + abs(H_mat[1, 2] - ex_dy)
+        return err <= max_deviation
 
     # 1. ORB on enhanced frames
     H = _estimate_affine(enhanced_a, enhanced_b)
     if H is not None and not _is_valid_affine(H, frame_b.shape):
         H = None
-    if H is not None and _direction_ok(H, fallback_direction, frame_b.shape):
+    if H is not None and _direction_ok(H, fallback_direction, frame_b.shape) and _within_tolerance(H):
         candidates.append(("orb_enhanced", H))
 
     # 2. Template matching on enhanced frames
     H = _template_affine(enhanced_a, enhanced_b)
-    if H is not None and _direction_ok(H, fallback_direction, frame_b.shape):
+    if H is not None and _direction_ok(H, fallback_direction, frame_b.shape) and _within_tolerance(H):
         candidates.append(("template_enhanced", H))
 
     # 3. Phase correlation (very robust for repetitive textures)
     H = _phase_correlation_affine(frame_a, frame_b, direction=fallback_direction)
-    if H is not None:
+    if H is not None and _within_tolerance(H):
         candidates.append(("phase_corr", H))
 
     # 4. ORB on raw frames
@@ -421,13 +445,13 @@ def _match_pair(
         H = _estimate_affine(frame_a, frame_b)
         if H is not None and not _is_valid_affine(H, frame_b.shape):
             H = None
-        if H is not None and _direction_ok(H, fallback_direction, frame_b.shape):
+        if H is not None and _direction_ok(H, fallback_direction, frame_b.shape) and _within_tolerance(H):
             candidates.append(("orb_raw", H))
 
     # 5. Template matching on raw frames
     if not candidates:
         H = _template_affine(frame_a, frame_b)
-        if H is not None and _direction_ok(H, fallback_direction, frame_b.shape):
+        if H is not None and _direction_ok(H, fallback_direction, frame_b.shape) and _within_tolerance(H):
             candidates.append(("template_raw", H))
 
     # If we have an expected offset, pick the candidate closest to it
@@ -451,15 +475,20 @@ def _match_pair(
         logger.debug(f"  Best match: {best_name} (dx={best_H[0,2]:.0f}, dy={best_H[1,2]:.0f})")
         return best_H, False
 
-    # Last resort: use expected offset if available, else generic guess
-    h, w = frame_a.shape[:2]
+    # All matching failed or all candidates were outside tolerance —
+    # use expected offset directly if available (camera positions are
+    # reliable), else generic guess.
     H = np.eye(3, dtype=np.float64)
     if expected_offset is not None:
         H[0, 2], H[1, 2] = expected_offset
-        logger.warning(
-            f"  All matching failed — using expected offset "
+        logger.info(
+            f"  Using camera-position placement "
             f"(dx={expected_offset[0]:.0f}, dy={expected_offset[1]:.0f})"
         )
+        # Position-based placement is not a "failure" — it's a reliable
+        # fallback from known geometry.  Return False so it's not counted
+        # as a fallback warning.
+        return H, False
     elif fallback_direction == "vertical":
         overlap_guess = int(h * 0.15)
         H[1, 2] = h - overlap_guess
