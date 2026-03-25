@@ -604,17 +604,21 @@ async def _calibrated_scan(
     top    = bounds.get("top")
     bottom = bounds.get("bottom")
 
-    # Fallback: migrate from old {top_left, bottom_right} format
+    # Selectively fill missing edges from old {top_left, bottom_right} format
+    old_tl = bounds.get("top_left")
+    old_br = bounds.get("bottom_right")
+    if old_tl and left is None:
+        left = old_tl.get("pan")
+    if old_br and right is None:
+        right = old_br.get("pan")
+    if old_tl and top is None:
+        top = old_tl.get("tilt")
+    if old_br and bottom is None:
+        bottom = old_br.get("tilt")
+
     if left is None or right is None or top is None or bottom is None:
-        tl = bounds.get("top_left")
-        br = bounds.get("bottom_right")
-        if not tl or not br:
-            logger.error("No camera bounds saved — cannot do calibrated scan. Set bounds in Calibration.")
-            return []
-        left   = int(tl["pan"])
-        right  = int(br["pan"])
-        top    = int(tl["tilt"])
-        bottom = int(br["tilt"])
+        logger.error("No camera bounds saved — cannot do calibrated scan. Set bounds in Calibration.")
+        return [], (0, 0), []
 
     pan_tl,  tilt_tl = int(left),  int(top)
     pan_br,  tilt_br = int(right), int(bottom)
