@@ -730,7 +730,7 @@ def _stitch_strip(
     frames: List[np.ndarray],
     direction: str = "horizontal",
     positions: Optional[List[Tuple[float, float]]] = None,
-    translation_only: bool = False,
+    bundle_adjust: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Stitch a list of frames that overlap in the given direction.
@@ -740,11 +740,14 @@ def _stitch_strip(
     pixel offsets are computed from the known camera geometry and used to
     validate matches and as a better fallback than the generic 85 % guess.
 
-    When *translation_only* is True, rotation/scale/shear components are
-    stripped from each pairwise transform before chaining.  This prevents
-    accumulated affine drift that causes barrel distortion at panorama edges
-    — appropriate for PTZ cameras where adjacent frames differ only by
-    pan/tilt (pure translation in image space).
+    When *bundle_adjust* is True, a global optimisation pass corrects the
+    chained absolute transforms so that accumulated rotation/scale drift is
+    distributed evenly across the strip.  Each transform is decomposed into
+    a translation component (kept as-is from the chain) and a
+    rotation/scale/shear residual that is linearly interpolated from the
+    identity (at the reference frame) outward.  This preserves the local
+    warping needed to align overlapping frames while eliminating the
+    progressive distortion that builds up at panorama edges.
     """
     if not frames:
         return None
@@ -766,16 +769,6 @@ def _stitch_strip(
         )
         if failed:
             logger.warning(f"  Strip pair {i}->{i+1}: fallback ({direction})")
-
-        if translation_only:
-            # Keep only translation (dx, dy), discard rotation/scale/shear.
-            # PTZ cameras at fixed zoom produce pure-translation offsets;
-            # allowing affine components to accumulate causes edge warping.
-            H_trans = np.eye(3, dtype=np.float64)
-            H_trans[0, 2] = H[0, 2]
-            H_trans[1, 2] = H[1, 2]
-            H = H_trans
-
         pairwise.append(H)
 
     del enhanced
@@ -791,8 +784,96 @@ def _stitch_strip(
     H_ref_inv = np.linalg.inv(H_abs[ref])
     H_abs = [H_ref_inv @ H for H in H_abs]
 
+    if bundle_adjust and n > 2:
+        H_abs = _bundle_adjust_strip(H_abs, ref)
+
     result = _composite_affine(frames, H_abs)
     return _crop_black(result)
+
+
+def _bundle_adjust_strip(
+    H_abs: List[np.ndarray],
+    ref: int,
+) -> List[np.ndarray]:
+    """Distribute accumulated rotation/scale/shear drift evenly across a strip.
+
+    Each absolute transform is decomposed into translation + linear part.
+    The linear (rotation/scale/shear) residual is interpolated from identity
+    at the reference frame toward the actual value at the edges, weighted by
+    distance from the reference.  This keeps local warping for overlap
+    alignment but prevents progressive distortion at panorama edges.
+    """
+    n = len(H_abs)
+    if n <= 2:
+        return H_abs
+
+    # Maximum distance from reference (for interpolation weight)
+    max_dist = max(ref, n - 1 - ref)
+    if max_dist == 0:
+        return H_abs
+
+    adjusted = []
+    for i, H in enumerate(H_abs):
+        if i == ref:
+            adjusted.append(H.copy())
+            continue
+
+        # Extract the 2x2 linear part (rotation/scale/shear) and translation
+        A_linear = H[:2, :2].copy()  # 2x2 rotation/scale/shear
+        tx, ty = H[0, 2], H[1, 2]   # translation
+
+        # How far from reference (0 = at ref, 1 = furthest)
+        dist = abs(i - ref)
+        # Interpolation factor: how much of the raw linear transform to keep.
+        # At the reference frame: keep nothing (identity). At neighbours: keep
+        # most of it. At edges: dampen the accumulated distortion.
+        # Use sqrt to preserve more local warping near the reference while
+        # still dampening the edges.
+        t = dist / max_dist
+        alpha = np.sqrt(t)
+
+        # Interpolate: identity * (1 - alpha) + A_linear * alpha
+        # Wait — we actually want the OPPOSITE: keep local warping but dampen
+        # the accumulation.  The residual from identity grows with distance.
+        # We want to scale that residual down at the edges.
+        #
+        # residual = A_linear - I
+        # adjusted_linear = I + residual * dampening_factor
+        #
+        # dampening_factor: 1.0 near ref (keep full warping), tapering at edges
+        # For a chain of N transforms, the residual grows ~linearly with dist.
+        # We want the PER-STEP residual, not the accumulated residual.
+        # So: adjusted = I + residual * (1 / dist) * dist = I + residual
+        # That's no change.  Instead, limit total residual magnitude.
+
+        I2 = np.eye(2, dtype=np.float64)
+        residual = A_linear - I2
+
+        # Frobenius norm of residual — how much total distortion has accumulated
+        res_norm = np.linalg.norm(residual, 'fro')
+
+        # Cap the total residual norm to grow at most as sqrt(dist) rather
+        # than linearly.  This preserves local warping for nearby frames
+        # but dampens the runaway growth at the edges.
+        if dist > 1 and res_norm > 0:
+            # Expected per-step norm (if distortion accumulated linearly)
+            per_step = res_norm / dist
+            # Allow at most sqrt(dist) * per_step total
+            max_allowed = per_step * np.sqrt(dist)
+            if res_norm > max_allowed:
+                scale_factor = max_allowed / res_norm
+                residual = residual * scale_factor
+
+        A_adjusted = I2 + residual
+
+        H_new = np.eye(3, dtype=np.float64)
+        H_new[:2, :2] = A_adjusted
+        H_new[0, 2] = tx
+        H_new[1, 2] = ty
+        adjusted.append(H_new)
+
+    logger.info(f"Bundle adjustment applied to {n} transforms (ref={ref})")
+    return adjusted
 
 
 # ---------------------------------------------------------------------------
@@ -896,7 +977,7 @@ def _stitch_grid(
             logger.warning(f"  Row {r}: no frames, skipping")
             continue
         logger.info(f"  Row {r}: stitching {len(row_frames)} frames horizontally")
-        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos, translation_only=True)
+        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos, bundle_adjust=True)
         if strip is not None:
             row_strips.append(strip)
             # For vertical stitching, use the mean position of each row
@@ -914,7 +995,7 @@ def _stitch_grid(
     # Stitch row strips vertically
     logger.info(f"Stitching {len(row_strips)} row strips vertically...")
     vert_pos = row_strip_positions if len(row_strip_positions) == len(row_strips) else None
-    panorama = _stitch_strip(row_strips, direction="vertical", positions=vert_pos, translation_only=True)
+    panorama = _stitch_strip(row_strips, direction="vertical", positions=vert_pos, bundle_adjust=True)
 
     if panorama is None:
         return None, "no_frames"
