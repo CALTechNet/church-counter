@@ -538,8 +538,6 @@ async def _preset_scan(
         )
     else:
         await asyncio.sleep(3.0)
-    # Brief settle after arriving
-    await asyncio.sleep(0.1)
 
     if cancelled():
         return frames, grid_shape
@@ -564,8 +562,6 @@ async def _preset_scan(
             )
         else:
             await asyncio.sleep(TRAVEL_TIME)
-        # Brief settle for vibration damping
-        await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
@@ -685,9 +681,6 @@ async def _calibrated_scan(
         pan0, tilt0,
         lambda: move_abs(pan0, tilt0),
     )
-    # Brief settle for vibration damping
-    await asyncio.sleep(0.075)
-
     if cancelled():
         return frames, (rows, cols), positions
 
@@ -707,8 +700,6 @@ async def _calibrated_scan(
             pan, tilt,
             lambda p=pan, t=tilt: move_abs(p, t, pan_speed=24, tilt_speed=20),
         )
-        # Brief settle for vibration damping
-        await asyncio.sleep(0.1)
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
