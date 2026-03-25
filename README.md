@@ -138,7 +138,7 @@ Images are signed with [cosign](https://github.com/sigstore/cosign) via the Sigs
 
 ## Frontend Build Versioning
 
-The frontend version is tracked in `frontend/src/version.js` as `v1.1.{BUILD}`. The `BUILD` number is **automatically incremented** by a `prebuild` script every time `npm run build` is executed (including during `docker compose up --build`).
+The frontend version is tracked in `frontend/src/version.js` as `v1.2.{BUILD}`. The `BUILD` number is **automatically incremented** by a `prebuild` script every time `npm run build` is executed (including during `docker compose up --build`).
 
 To check the current version, look at the bottom-right footer of the UI.
 
