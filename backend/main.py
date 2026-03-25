@@ -118,7 +118,10 @@ async def run_scan(service_type: str = "Manual", room_id: str = None):
             logger.info(f"Single frame capture for {room_name} → shape {panorama.shape}")
         else:
             await _progress("Stitching panorama…", 93)
-            panorama, stitch_status = stitch.stitch_frames(frames, grid_shape=grid_shape, positions=positions)
+            scan_mode = room.get("scan_mode", "preset")
+            panorama, stitch_status = stitch.stitch_frames(
+                frames, grid_shape=grid_shape, positions=positions, scan_mode=scan_mode,
+            )
             if panorama is None:
                 raise RuntimeError("Panorama stitching failed")
             logger.info(f"Stitch: {stitch_status} → shape {panorama.shape}")

@@ -718,7 +718,11 @@ def _estimate_expected_offsets(
         for i in range(n - 1):
             dp = positions[i + 1][0] - positions[i][0]
             dt = positions[i + 1][1] - positions[i][1]
-            offsets.append((dp * pixels_per_tilt, dt * pixels_per_tilt))
+            # Rows are ordered top→bottom in the grid, so each subsequent
+            # row strip should be BELOW the previous one (positive dy).
+            # Some cameras have inverted tilt (higher value = looking up),
+            # so use abs(dt) to guarantee downward progression.
+            offsets.append((dp * pixels_per_tilt, abs(dt) * pixels_per_tilt))
         return offsets
 
 
@@ -907,23 +911,58 @@ def _stitch_grid(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _stitch_opencv(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]:
+    """
+    OpenCV Stitcher-based panorama (RANSAC feature matching).
+    Used for preset scans where frame ordering / grid geometry is unknown.
+    Falls back to horizontal concat if stitching fails.
+    """
+    unique = _deduplicate(frames)
+    logger.info(f"OpenCV stitch: {len(unique)} unique frames (from {len(frames)} captured)")
+
+    # Try enhanced frames first (better keypoints in low light)
+    enhanced = [enhance_frame(f) for f in unique]
+    stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+    status, pano = stitcher.stitch(enhanced)
+
+    if status == cv2.Stitcher_OK:
+        pano = _crop_black(pano)
+        logger.info(f"OpenCV stitch OK (enhanced) — output shape: {pano.shape}")
+        return pano, "ok"
+
+    logger.warning(f"Enhanced OpenCV stitch failed (status={status}), trying original…")
+
+    status2, pano2 = stitcher.stitch(unique)
+    if status2 == cv2.Stitcher_OK:
+        pano2 = _crop_black(pano2)
+        logger.info(f"OpenCV stitch OK (original) — output shape: {pano2.shape}")
+        return pano2, "ok_original"
+
+    logger.warning("Both OpenCV stitch attempts failed, using fallback concat")
+
+    # Fallback: resize all to same height and concat horizontally
+    target_h = min(f.shape[0] for f in unique)
+    resized = []
+    for f in unique:
+        h, w = f.shape[:2]
+        new_w = int(w * target_h / h)
+        resized.append(cv2.resize(f, (new_w, target_h)))
+    return np.hstack(resized), "fallback_concat"
+
+
 def stitch_frames(
     frames: List[np.ndarray],
     grid_shape: Optional[Tuple[int, int]] = None,
     positions: Optional[List[Tuple[float, float]]] = None,
+    scan_mode: Optional[str] = None,
 ) -> Tuple[Optional[np.ndarray], str]:
     """
     Stitch a sequence of overlapping frames into a single panorama.
 
-    When grid_shape=(rows, cols) is provided, uses grid-aware stitching
-    that properly handles the boustrophedon scan pattern by stitching
-    rows first, then stacking vertically.
-
-    When *positions* (list of (pan, tilt) per frame in scan order) is
-    provided alongside grid_shape, the known camera geometry guides
-    alignment — reducing ghosting on dark / repetitive scenes.
-
-    When grid_shape is None, falls back to sequential chain stitching.
+    *scan_mode* controls which algorithm is used:
+      - "preset"    → OpenCV Stitcher (RANSAC feature matching + fallback concat)
+      - "calibrated"→ Grid-aware affine stitching with position guidance
+      - None        → auto-select based on whether grid_shape is provided
 
     Returns (panorama_image, status_string).
     """
@@ -933,7 +972,20 @@ def stitch_frames(
     if len(frames) == 1:
         return frames[0], "single_frame"
 
-    if grid_shape is not None:
+    # Route to the correct algorithm based on scan mode
+    if scan_mode == "preset":
+        panorama, status = _stitch_opencv(frames)
+    elif scan_mode == "calibrated" and grid_shape is not None:
+        rows, cols = grid_shape
+        if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
+            panorama, status = _stitch_grid(frames, rows, cols, positions=positions)
+        else:
+            logger.warning(
+                f"Grid shape {grid_shape} doesn't match frame count "
+                f"{len(frames)}, falling back to sequential"
+            )
+            panorama, status = _stitch_sequential(frames)
+    elif grid_shape is not None:
         rows, cols = grid_shape
         if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
             panorama, status = _stitch_grid(frames, rows, cols, positions=positions)
