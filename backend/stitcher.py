@@ -42,18 +42,24 @@ def enhance_frame(frame: np.ndarray) -> np.ndarray:
 
 
 def _brighten_output(img: np.ndarray) -> np.ndarray:
-    """Apply brightness/contrast boost to the final panorama output.
+    """Apply uniform brightness/contrast boost to the final panorama output.
 
-    This makes the stored panorama brighter for both human viewing and
-    downstream YOLO detection.  The detector's enhance_image() applies
-    additional per-tile CLAHE + gamma on top of this.
+    Uses a global gamma correction for even brightness across the whole
+    stitched image, plus CLAHE with a large tile grid scaled to the panorama
+    size so that brightness is consistent across seams.
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    # CLAHE to lift local contrast in dark regions
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
+    # Scale CLAHE tile grid to panorama size so tiles are ~256px each,
+    # giving smooth, even local contrast without visible tile boundaries.
+    h, w = l.shape[:2]
+    tile_w = max(1, w // 256)
+    tile_h = max(1, h // 256)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
     l = clahe.apply(l)
-    # Gamma correction: gamma=1.8 → exponent 1/1.8 ≈ 0.56, strong brighten
+
+    # Global gamma correction on L channel for uniform brightening
     lut = np.array(
         [((i / 255.0) ** (1.0 / 1.8)) * 255 for i in range(256)],
         dtype=np.uint8,
