@@ -24,6 +24,57 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Lens distortion correction
+# ---------------------------------------------------------------------------
+
+def undistort_frame(frame: np.ndarray, k1: float = -0.32, k2: float = 0.12) -> np.ndarray:
+    """Remove barrel/pincushion distortion from a PTZ camera frame.
+
+    Uses the Brown–Conrady model with radial coefficients *k1* and *k2*.
+    Negative k1 corrects barrel distortion (edges curve inward);
+    positive k1 corrects pincushion distortion.
+
+    The camera matrix is synthesised from the frame dimensions, assuming
+    the optical centre is at the image centre and focal length is
+    approximately equal to the frame width (typical for PTZ cameras at
+    moderate-to-high zoom).
+    """
+    if k1 == 0.0 and k2 == 0.0:
+        return frame
+
+    h, w = frame.shape[:2]
+    # Approximate focal length — at high zoom the FOV is narrow so
+    # f ≈ w is a reasonable starting estimate.  The exact value isn't
+    # critical because k1/k2 are tuned empirically to match.
+    fx = fy = float(w)
+    cx, cy = w / 2.0, h / 2.0
+
+    camera_matrix = np.array([
+        [fx,  0, cx],
+        [ 0, fy, cy],
+        [ 0,  0,  1],
+    ], dtype=np.float64)
+
+    dist_coeffs = np.array([k1, k2, 0, 0, 0], dtype=np.float64)
+
+    # getOptimalNewCameraMatrix with alpha=1 retains all pixels (no crop);
+    # alpha=0 crops aggressively.  We use 0.5 to balance: remove the worst
+    # barrel warp at the periphery while keeping most of the image.
+    new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
+        camera_matrix, dist_coeffs, (w, h), alpha=0.5,
+    )
+
+    undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_camera_matrix)
+
+    # Crop to the valid ROI to remove black borders from remapping
+    rx, ry, rw, rh = roi
+    if rw > 0 and rh > 0:
+        undistorted = undistorted[ry:ry + rh, rx:rx + rw]
+
+    return undistorted
+
+
+# ---------------------------------------------------------------------------
 # Enhancement
 # ---------------------------------------------------------------------------
 
@@ -583,16 +634,17 @@ def _composite_affine(
         )
         valid = (warped_mask > 128).astype(np.uint8)
 
-        # Larger erosion to remove edge artifacts and vignetting
-        kernel = np.ones((5, 5), np.uint8)
-        valid = cv2.erode(valid, kernel, iterations=4)
+        # Generous erosion removes edge artefacts from lens distortion,
+        # vignetting, and warp-interpolation fringes that cause ghosting.
+        kernel = np.ones((7, 7), np.uint8)
+        valid = cv2.erode(valid, kernel, iterations=6)
 
         dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5)
 
-        # Power-weight the distance so centre pixels dominate more strongly;
-        # this makes the transition zone narrower and hides residual brightness
-        # differences better than linear weighting.
-        dist = np.power(dist, 2.0)
+        # Power-weight the distance so centre pixels dominate strongly;
+        # exponent 3.0 gives a very narrow transition zone that hides
+        # residual misalignment (ghosting) in overlap regions.
+        dist = np.power(dist, 3.0)
 
         canvas += warped.astype(np.float32) * dist[:, :, None]
         weight += dist
@@ -981,6 +1033,9 @@ def stitch_frames(
       - "calibrated"→ Grid-aware affine stitching with position guidance
       - None        → auto-select based on whether grid_shape is provided
 
+    Barrel / pincushion lens distortion is automatically corrected on
+    each frame before stitching (via ``undistort_frame``).
+
     Returns (panorama_image, status_string).
     """
     if not frames:
@@ -988,6 +1043,10 @@ def stitch_frames(
 
     if len(frames) == 1:
         return frames[0], "single_frame"
+
+    # --- Automatic lens distortion correction ---
+    logger.info(f"Applying lens undistortion to {len(frames)} frames")
+    frames = [undistort_frame(f) for f in frames]
 
     # Route to the correct algorithm based on scan mode
     if scan_mode == "preset":
