@@ -28,6 +28,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Log GPU status at startup ────────────────────────────────────────────────
+def _log_hardware_info():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            vram = torch.cuda.get_device_properties(0).total_mem / 1024 / 1024
+            logger.info(f"Hardware: GPU acceleration enabled — {gpu_name} ({vram:.0f} MB VRAM)")
+            logger.info(f"Hardware: CUDA {torch.version.cuda}, PyTorch {torch.__version__}")
+        else:
+            logger.info("Hardware: No GPU detected — running in CPU-only mode")
+    except ImportError:
+        logger.info("Hardware: PyTorch not available — running in CPU-only mode")
+
+_log_hardware_info()
+
 SVG_PATH = Path("/config/seats.svg")
 FRONTEND_DIR = Path("/frontend/build")
 

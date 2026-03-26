@@ -1,0 +1,49 @@
+# ── Stage 1: Build React frontend ────────────────────────────────────────────
+FROM node:20-alpine AS frontend
+WORKDIR /app
+COPY frontend/package*.json ./
+RUN npm ci --silent
+COPY frontend/ ./
+RUN npm run build
+
+# ── Stage 2: Python backend with CUDA support ───────────────────────────────
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+# System libs for OpenCV + Python
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-dev \
+    libglib2.0-0 libsm6 libxext6 libxrender1 libgl1 libgomp1 \
+    ffmpeg \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install PyTorch with CUDA support (overrides CPU-only version from ultralytics)
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+# Upgrade ultralytics to fix PyTorch 2.6 weights_only compatibility
+RUN pip install --upgrade ultralytics
+
+# Backend source
+COPY backend/ ./backend/
+
+# Built frontend from stage 1
+COPY --from=frontend /app/build /frontend/build
+
+# Runtime directories
+RUN mkdir -p /data /config
+
+# NVIDIA runtime env vars
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+EXPOSE 8000
+
+WORKDIR /app/backend
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
