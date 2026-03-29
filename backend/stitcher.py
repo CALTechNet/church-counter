@@ -1080,16 +1080,8 @@ def stitch_frames(
     # Route to the correct algorithm based on scan mode
     if scan_mode == "preset":
         panorama, status = _stitch_opencv(frames)
-    elif scan_mode == "calibrated" and grid_shape is not None:
-        rows, cols = grid_shape
-        if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
-            panorama, status = _stitch_grid(frames, rows, cols, positions=positions)
-        else:
-            logger.warning(
-                f"Grid shape {grid_shape} doesn't match frame count "
-                f"{len(frames)}, falling back to sequential"
-            )
-            panorama, status = _stitch_sequential(frames)
+    elif scan_mode == "calibrated":
+        panorama, status = _stitch_opencv(frames)
     elif grid_shape is not None:
         rows, cols = grid_shape
         if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
