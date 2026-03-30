@@ -27,6 +27,12 @@ body {
   50% { opacity: 1; }
 }
 
+/* Indeterminate scan progress animation */
+@keyframes scanSlide {
+  0%   { left: -30%; }
+  100% { left: 100%; }
+}
+
 /* Graph zoom/scroll */
 .recharts-wrapper {
   user-select: none;
