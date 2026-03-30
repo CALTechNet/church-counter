@@ -16,6 +16,8 @@ accumulated perspective distortion across many frames.
 import base64
 import gc
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
 import cv2
@@ -964,10 +966,11 @@ def _stitch_grid(
         occupied = sum(1 for c in range(cols) if grid[r][c] is not None)
         logger.info(f"  Row {r}: {occupied}/{cols} frames")
 
-    # Stitch each row horizontally
+    # Stitch each row horizontally (parallel across rows)
     logger.info("Stitching rows horizontally...")
-    row_strips: List[np.ndarray] = []
-    row_strip_positions: List[Optional[Tuple[float, float]]] = []
+
+    # Build row tasks
+    row_tasks = []  # (row_index, row_frames, row_positions)
     for r in range(rows):
         row_frames = [grid[r][c] for c in range(cols) if grid[r][c] is not None]
         row_pos = None
@@ -977,15 +980,30 @@ def _stitch_grid(
             logger.warning(f"  Row {r}: no frames, skipping")
             continue
         logger.info(f"  Row {r}: stitching {len(row_frames)} frames horizontally")
+        row_tasks.append((r, row_frames, row_pos))
+
+    def _stitch_row(task):
+        r, row_frames, row_pos = task
         strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos, translation_only=True)
+        mean_pos = None
+        if strip is not None and row_pos:
+            mean_pos = (np.mean([p[0] for p in row_pos]), np.mean([p[1] for p in row_pos]))
+        return r, strip, mean_pos
+
+    n_row_workers = min(len(row_tasks), os.cpu_count() or 4)
+    row_strips: List[np.ndarray] = []
+    row_strip_positions: List[Optional[Tuple[float, float]]] = []
+
+    with ThreadPoolExecutor(max_workers=n_row_workers) as pool:
+        results = list(pool.map(_stitch_row, row_tasks))
+
+    # Collect results in row order
+    for r, strip, mean_pos in sorted(results, key=lambda x: x[0]):
         if strip is not None:
             row_strips.append(strip)
-            # For vertical stitching, use the mean position of each row
-            if row_pos:
-                mean_pan = np.mean([p[0] for p in row_pos])
-                mean_tilt = np.mean([p[1] for p in row_pos])
-                row_strip_positions.append((mean_pan, mean_tilt))
-        gc.collect()
+            if mean_pos:
+                row_strip_positions.append(mean_pos)
+    gc.collect()
 
     if not row_strips:
         return None, "no_frames"
@@ -1073,15 +1091,29 @@ def stitch_frames(
     if len(frames) == 1:
         return frames[0], "single_frame"
 
-    # --- Automatic lens distortion correction ---
+    # --- Automatic lens distortion correction (parallel) ---
     logger.info(f"Applying lens undistortion to {len(frames)} frames")
-    frames = [undistort_frame(f) for f in frames]
+    n_workers = min(len(frames), os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        frames = list(pool.map(undistort_frame, frames))
 
     # Route to the correct algorithm based on scan mode
     if scan_mode == "preset":
         panorama, status = _stitch_opencv(frames)
+    elif scan_mode == "calibrated" and grid_shape is not None:
+        rows, cols = grid_shape
+        if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
+            panorama, status = _stitch_grid(frames, rows, cols, positions=positions)
+        else:
+            logger.warning(
+                f"Calibrated mode but grid shape {grid_shape} doesn't match "
+                f"frame count {len(frames)}, falling back to OpenCV stitcher"
+            )
+            panorama, status = _stitch_opencv(frames)
     elif scan_mode == "calibrated":
-        panorama, status = _stitch_opencv(frames)
+        # Calibrated mode without grid info — fall back to sequential
+        logger.warning("Calibrated mode but no grid_shape provided, using sequential stitch")
+        panorama, status = _stitch_sequential(frames)
     elif grid_shape is not None:
         rows, cols = grid_shape
         if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
