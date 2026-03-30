@@ -172,7 +172,7 @@ export default function CalibrationWizard({ onClose }) {
       })
       setSaved(true)
       setStatus('Bounds saved!')
-      setTimeout(onClose, 900)
+      setTimeout(() => setSaved(false), 1500)
     } catch (e) {
       setStatus(`Error saving: ${e.message}`)
     } finally {
@@ -253,7 +253,8 @@ export default function CalibrationWizard({ onClose }) {
               </>
             )}
 
-            <style>{`@keyframes livePulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
+            <style>{`@keyframes livePulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }`}</style>
           </div>
 
           {/* ── Right sidebar ── */}
@@ -349,6 +350,15 @@ export default function CalibrationWizard({ onClose }) {
               >
                 {saved ? '✓ Saved!' : saving ? 'Saving…' : 'Save Bounds'}
               </button>
+              {/* Current bounds summary */}
+              <div style={{ marginTop: 10, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, padding: '8px 10px', fontSize: 11, fontFamily: 'monospace', color: C.muted, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: C.text, marginBottom: 2 }}>Current Bounds</div>
+                <div>Top:    <span style={{ color: topTilt != null ? C.yellow : C.muted }}>{topTilt != null ? topTilt : '--'}</span></div>
+                <div>Bottom: <span style={{ color: bottomTilt != null ? C.orange : C.muted }}>{bottomTilt != null ? bottomTilt : '--'}</span></div>
+                <div>Left:   <span style={{ color: leftPan != null ? C.green : C.muted }}>{leftPan != null ? leftPan : '--'}</span></div>
+                <div>Right:  <span style={{ color: rightPan != null ? C.accent : C.muted }}>{rightPan != null ? rightPan : '--'}</span></div>
+                <div>Zoom:   <span style={{ color: scanZoom != null ? C.yellow : C.muted }}>{scanZoom != null ? scanZoom : '--'}</span></div>
+              </div>
             </div>
           </div>
         </div>
@@ -473,7 +483,7 @@ function NumericInput({ label, color, value, onChange, min = -32768, max = 32767
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-      <span style={{ fontSize: 9, color: color, fontWeight: 700, width: 52, flexShrink: 0 }}>{label}</span>
+      <span style={{ fontSize: 9, color: color, fontWeight: 700, width: 46, flexShrink: 0 }}>{label}</span>
       <input
         type="number"
         min={min}
@@ -491,11 +501,14 @@ function NumericInput({ label, color, value, onChange, min = -32768, max = 32767
           border: `1px solid ${value != null ? color : C.border}`,
           color: C.text,
           borderRadius: 4,
-          padding: '4px 6px',
+          padding: '4px 4px',
           fontSize: 11,
           fontFamily: 'monospace',
           outline: 'none',
           width: '100%',
+          MozAppearance: 'textfield',
+          WebkitAppearance: 'none',
+          appearance: 'textfield',
         }}
       />
     </div>
