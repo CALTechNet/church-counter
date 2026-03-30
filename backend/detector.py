@@ -148,6 +148,7 @@ def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
     and cross-tile NMS removes border duplicates.
     Returns list of unique person detections in full image coordinates.
     """
+    global _device
     model    = _get_model()
     h_orig, w_orig = image.shape[:2]
     logger.info(f"Starting detection — image {w_orig}x{h_orig}, "
