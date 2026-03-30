@@ -28,10 +28,8 @@ services:
       - TILE_BATCH_SIZE=16
       - YOLO_IMGSZ=640
       - ROCR_VISIBLE_DEVICES=all
-      # Let OpenCV use all CPU cores for non-OpenCL ops
+      # OPENCV_THREAD_COUNT=0 means "use all cores"; OMP/OPENBLAS unset = same default
       - OPENCV_THREAD_COUNT=0
-      - OMP_NUM_THREADS=0
-      - OPENBLAS_NUM_THREADS=0
     network_mode: bridge
     extra_hosts:
       - "host.docker.internal:host-gateway"

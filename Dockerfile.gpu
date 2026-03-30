@@ -82,8 +82,9 @@ COPY requirements.txt .
 RUN grep -v '^opencv' requirements.txt > /tmp/reqs-gpu.txt && \
     pip install --no-cache-dir -r /tmp/reqs-gpu.txt
 
-# PyTorch with CUDA support
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# PyTorch with CUDA support — cu118 is the last build that includes sm_61 (Pascal/GTX 1050).
+# cu118 wheels work fine with CUDA 12.x on the host (CUDA is backward compatible).
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
 # Upgrade ultralytics to fix PyTorch 2.6 weights_only compatibility
 RUN pip install --upgrade ultralytics
