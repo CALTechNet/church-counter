@@ -67,16 +67,16 @@ RUN echo "/opt/opencv/lib" > /etc/ld.so.conf.d/opencv.conf && ldconfig
 
 ENV PYTHONPATH=/opt/opencv/python:${PYTHONPATH}
 
-# Python deps (skip opencv — we built it from source with OpenCL)
-COPY requirements.txt .
-RUN grep -v '^opencv' requirements.txt > /tmp/reqs-rocm.txt && \
-    pip install --no-cache-dir -r /tmp/reqs-rocm.txt
-
-# PyTorch with ROCm support
+# PyTorch with ROCm support — MUST be installed FIRST, before ultralytics,
+# to prevent pip from pulling a default (CUDA) PyTorch build.
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
 
-# Upgrade ultralytics to fix PyTorch 2.6 weights_only compatibility
-RUN pip install --upgrade ultralytics
+# Python deps (skip opencv — built from source; skip ultralytics — installed
+# separately with --no-deps to prevent it from overriding the ROCm PyTorch).
+COPY requirements.txt .
+RUN grep -v -E '^(opencv|ultralytics)' requirements.txt > /tmp/reqs-rocm.txt && \
+    pip install --no-cache-dir -r /tmp/reqs-rocm.txt
+RUN pip install --no-cache-dir --no-deps 'ultralytics>=8.3.0'
 
 # Backend source
 COPY backend/ ./backend/
@@ -90,6 +90,9 @@ RUN mkdir -p /data /config
 # ROCm runtime env vars
 ENV HSA_OVERRIDE_GFX_VERSION=""
 ENV ROCR_VISIBLE_DEVICES=all
+
+# Ultralytics settings directory — writable location inside the container
+ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
 
 EXPOSE 8000
 
