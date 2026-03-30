@@ -273,6 +273,8 @@ export default function App() {
       {/* Progress bar */}
       {scanState.running && (() => {
         const isProcessing = scanState.progress >= 90
+        const isInitiating = scanState.progress === 0
+        const PROCESSING_SECS = 600 // ~10 minutes for stitching + counting
         const formatTime = (secs) => {
           const m = Math.floor(secs / 60)
           const s = Math.floor(secs % 60)
@@ -286,32 +288,56 @@ export default function App() {
             const pct = Math.max(scanState.progress, 1)
             const captureTotal = (elapsed / pct) * 88 // time for 0-88%
             const captureRemaining = Math.max(0, captureTotal - elapsed)
-            timeStr = `~${formatTime(Math.round(captureRemaining + 300))} remaining`
+            timeStr = `~${formatTime(Math.round(captureRemaining + PROCESSING_SECS))} remaining`
           } else if (processingStartedAt) {
-            // Processing phase: 5-min countdown
+            // Processing phase: 10-min countdown for stitching + counting
             const processingElapsed = (now - processingStartedAt) / 1000
-            const remaining = Math.max(0, 300 - processingElapsed)
+            const remaining = Math.max(0, PROCESSING_SECS - processingElapsed)
             timeStr = `~${formatTime(Math.round(remaining))} remaining`
           }
         }
-        const displayMessage = isProcessing && scanState.progress < 100
-          ? 'Scan is processing…'
-          : scanState.message
+        const displayMessage = isInitiating
+          ? '✓ Scan initiated — starting camera sweep…'
+          : isProcessing && scanState.progress < 100
+            ? 'Stitching & counting — please wait…'
+            : scanState.message
         return (
-          <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '6px 24px', display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div style={{ flex: 1, background: C.border, borderRadius: 4, height: 6, overflow: 'hidden' }}>
-              <div style={{
-                width: isProcessing ? '100%' : `${scanState.progress}%`,
-                height: '100%',
-                background: isProcessing ? C.yellow : C.accent,
-                transition: 'width 0.5s',
-                borderRadius: 4,
-                ...(isProcessing ? { animation: 'pulse 2s ease-in-out infinite', opacity: 0.8 } : {}),
-              }} />
+          <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '8px 24px', display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ flex: 1, background: C.border, borderRadius: 4, height: 8, overflow: 'hidden', position: 'relative' }}>
+              {isInitiating ? (
+                /* Indeterminate animated bar while scan is initiating */
+                <div style={{
+                  position: 'absolute', top: 0, left: 0,
+                  width: '30%', height: '100%',
+                  background: `linear-gradient(90deg, transparent, ${C.accent}, transparent)`,
+                  borderRadius: 4,
+                  animation: 'scanSlide 1.5s ease-in-out infinite',
+                }} />
+              ) : (
+                <div style={{
+                  width: isProcessing ? '100%' : `${scanState.progress}%`,
+                  height: '100%',
+                  background: isProcessing ? C.yellow : C.accent,
+                  transition: 'width 0.5s',
+                  borderRadius: 4,
+                  ...(isProcessing ? { animation: 'pulse 2s ease-in-out infinite', opacity: 0.8 } : {}),
+                }} />
+              )}
             </div>
-            <span style={{ fontSize: 12, color: C.muted, whiteSpace: 'nowrap', minWidth: 220 }}>
-              {displayMessage} {scanState.progress < 90 ? `(${scanState.progress}%)` : ''} {timeStr && `· ${timeStr}`}
+            <span style={{ fontSize: 12, color: isInitiating ? C.green : C.muted, fontWeight: isInitiating ? 600 : 400, whiteSpace: 'nowrap', minWidth: 220 }}>
+              {displayMessage} {!isInitiating && scanState.progress < 90 ? `(${scanState.progress}%)` : ''}
             </span>
+            {timeStr && (
+              <span style={{
+                fontSize: 13, fontWeight: 700, fontFamily: 'monospace',
+                color: isProcessing ? C.yellow : C.accent,
+                whiteSpace: 'nowrap',
+                background: C.bg, borderRadius: 6, padding: '3px 10px',
+                border: `1px solid ${isProcessing ? C.yellow : C.accent}`,
+              }}>
+                {timeStr}
+              </span>
+            )}
           </div>
         )
       })()}
