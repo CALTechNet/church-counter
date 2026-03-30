@@ -170,11 +170,13 @@ async def run_scan(service_type: str = "Manual", room_id: str = None):
                 raise RuntimeError("Panorama stitching failed")
             logger.info(f"Stitch: {stitch_status} → shape {panorama.shape}")
 
+        del frames  # free raw camera frames before detection
         # 3. Detect
         await _progress("Running AI detection…", 96)
         raw_image_b64 = stitch.to_base64(panorama)
         detections = det.detect_people(panorama)
         annotated  = det.draw_detections(panorama, detections)
+        del panorama  # free ~720 MB before encoding annotated image
         image_b64  = stitch.to_base64(annotated)
         total      = len(detections)
         logger.info(f"Detected {total} people in {room_name}")
