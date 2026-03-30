@@ -813,7 +813,7 @@ def _stitch_strip(
     frames: List[np.ndarray],
     direction: str = "horizontal",
     positions: Optional[List[Tuple[float, float]]] = None,
-    translation_only: bool = False,
+    constrain_transform: str = "similarity",
 ) -> Optional[np.ndarray]:
     """
     Stitch a list of frames that overlap in the given direction.
@@ -823,11 +823,15 @@ def _stitch_strip(
     pixel offsets are computed from the known camera geometry and used to
     validate matches and as a better fallback than the generic 85 % guess.
 
-    When *translation_only* is True, rotation/scale/shear components are
-    stripped from each pairwise transform before chaining.  This prevents
-    accumulated affine drift that causes barrel distortion at panorama edges
-    — appropriate for PTZ cameras where adjacent frames differ only by
-    pan/tilt (pure translation in image space).
+    *constrain_transform* controls how pairwise affine transforms are
+    simplified before chaining:
+      - "none"        — keep the full affine (translation + rotation + scale
+                        + shear).  Risk of accumulated drift on long strips.
+      - "similarity"  — keep translation + rotation but force uniform scale=1
+                        and zero shear.  Lets frames rotate slightly to match
+                        features while preventing scale/shear drift.
+      - "translation" — keep only (dx, dy).  Most rigid, may misalign if the
+                        camera isn't perfectly straight.
     """
     if not frames:
         return None
@@ -850,14 +854,25 @@ def _stitch_strip(
         if failed:
             logger.warning(f"  Strip pair {i}->{i+1}: fallback ({direction})")
 
-        if translation_only:
+        if constrain_transform == "translation":
             # Keep only translation (dx, dy), discard rotation/scale/shear.
-            # PTZ cameras at fixed zoom produce pure-translation offsets;
-            # allowing affine components to accumulate causes edge warping.
             H_trans = np.eye(3, dtype=np.float64)
             H_trans[0, 2] = H[0, 2]
             H_trans[1, 2] = H[1, 2]
             H = H_trans
+        elif constrain_transform == "similarity":
+            # Extract translation + rotation, force scale=1 and zero shear.
+            # This lets frames rotate slightly to match features without
+            # accumulated scale/shear drift across many frames.
+            a, b = H[0, 0], H[0, 1]
+            theta = np.arctan2(b, a)
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            H_sim = np.array([
+                [cos_t, -sin_t, H[0, 2]],
+                [sin_t,  cos_t, H[1, 2]],
+                [0,      0,     1       ],
+            ], dtype=np.float64)
+            H = H_sim
 
         pairwise.append(H)
 
@@ -960,6 +975,25 @@ def _stitch_grid(
     if positions is not None and len(positions) == len(frames):
         pos_grid = _arrange_boustrophedon_positions(positions, rows, cols)
         logger.info("Using known camera positions for alignment guidance")
+    else:
+        # Synthesize approximate positions from grid layout so the stitcher
+        # has expected-offset guidance even for preset scans without learned
+        # positions.  Use evenly-spaced synthetic pan/tilt values — the
+        # exact scale doesn't matter because _estimate_expected_offsets
+        # normalises by the total range.
+        logger.info("Synthesizing grid positions for alignment guidance (no learned positions)")
+        synthetic = []
+        for col in range(cols):
+            for row_idx in range(rows):
+                if col % 2 == 0:
+                    r = row_idx
+                else:
+                    r = rows - 1 - row_idx
+                # pan increases with column, tilt increases with row
+                synthetic.append((float(col * 100), float(r * 100)))
+        if len(synthetic) >= len(frames):
+            synthetic = synthetic[:len(frames)]
+            pos_grid = _arrange_boustrophedon_positions(synthetic, rows, cols)
 
     # Log grid occupancy
     for r in range(rows):
@@ -984,7 +1018,7 @@ def _stitch_grid(
 
     def _stitch_row(task):
         r, row_frames, row_pos = task
-        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos, translation_only=True)
+        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos, constrain_transform="similarity")
         mean_pos = None
         if strip is not None and row_pos:
             mean_pos = (np.mean([p[0] for p in row_pos]), np.mean([p[1] for p in row_pos]))
@@ -1013,7 +1047,7 @@ def _stitch_grid(
     # Stitch row strips vertically
     logger.info(f"Stitching {len(row_strips)} row strips vertically...")
     vert_pos = row_strip_positions if len(row_strip_positions) == len(row_strips) else None
-    panorama = _stitch_strip(row_strips, direction="vertical", positions=vert_pos, translation_only=True)
+    panorama = _stitch_strip(row_strips, direction="vertical", positions=vert_pos, constrain_transform="similarity")
 
     if panorama is None:
         return None, "no_frames"
