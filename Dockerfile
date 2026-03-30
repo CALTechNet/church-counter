@@ -32,6 +32,9 @@ COPY --from=frontend /app/build /frontend/build
 # Runtime directories
 RUN mkdir -p /data /config
 
+# Ultralytics settings directory — writable location inside the container
+ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
+
 EXPOSE 8000
 
 WORKDIR /app/backend

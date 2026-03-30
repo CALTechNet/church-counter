@@ -77,19 +77,18 @@ RUN echo "/opt/opencv/lib" > /etc/ld.so.conf.d/opencv.conf && ldconfig
 
 ENV PYTHONPATH=/opt/opencv/python:${PYTHONPATH}
 
-# Python deps (skip opencv — we built it from source with CUDA)
-COPY requirements.txt .
-RUN grep -v '^opencv' requirements.txt > /tmp/reqs-gpu.txt && \
-    pip install --no-cache-dir -r /tmp/reqs-gpu.txt
-
-# PyTorch with CUDA support — cu118 is the last build that includes sm_61 (Pascal/GTX 1050).
-# cu118 wheels work fine with CUDA 12.x on the host (CUDA is backward compatible).
+# PyTorch with CUDA support — MUST be installed FIRST, before ultralytics.
+# cu118 is the last build that includes sm_61 (Pascal/GTX 1050) kernels.
+# cu118 wheels work fine with CUDA 12.x+ on the host (backward compatible).
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
-# Upgrade ultralytics to fix PyTorch 2.6 weights_only compatibility.
-# --no-deps prevents ultralytics from pulling a newer PyTorch build that
-# drops sm_61 (Pascal/GTX 1050) CUDA kernel support.
-RUN pip install --no-cache-dir --no-deps --upgrade ultralytics
+# Python deps (skip opencv — built from source; skip ultralytics — installed
+# separately with --no-deps to prevent it from pulling a newer PyTorch that
+# drops sm_61 Pascal kernel support).
+COPY requirements.txt .
+RUN grep -v -E '^(opencv|ultralytics)' requirements.txt > /tmp/reqs-gpu.txt && \
+    pip install --no-cache-dir -r /tmp/reqs-gpu.txt
+RUN pip install --no-cache-dir --no-deps 'ultralytics>=8.3.0'
 
 # Backend source
 COPY backend/ ./backend/
@@ -103,6 +102,9 @@ RUN mkdir -p /data /config
 # NVIDIA runtime env vars
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Ultralytics settings directory — writable location inside the container
+ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
 
 EXPOSE 8000
 
