@@ -1098,7 +1098,18 @@ def stitch_frames(
         frames = list(pool.map(undistort_frame, frames))
 
     # Route to the correct algorithm based on scan mode
-    if scan_mode == "preset":
+    if scan_mode == "preset" and grid_shape is not None:
+        rows, cols = grid_shape
+        if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
+            logger.info(f"Preset scan with grid {rows}×{cols}: using grid-aware stitcher")
+            panorama, status = _stitch_grid(frames, rows, cols, positions=positions)
+        else:
+            logger.warning(
+                f"Preset scan but grid shape {grid_shape} doesn't match "
+                f"frame count {len(frames)}, falling back to OpenCV stitcher"
+            )
+            panorama, status = _stitch_opencv(frames)
+    elif scan_mode == "preset":
         panorama, status = _stitch_opencv(frames)
     elif scan_mode == "calibrated" and grid_shape is not None:
         rows, cols = grid_shape
