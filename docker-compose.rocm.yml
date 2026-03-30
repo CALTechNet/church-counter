@@ -13,8 +13,6 @@ services:
       - ./data:/data
       - ./config:/config
       - ./models:/models
-    mem_limit: 12g
-    memswap_limit: 12g
     # AMD GPU device passthrough — requires amdgpu kernel driver on host
     devices:
       - /dev/kfd:/dev/kfd
