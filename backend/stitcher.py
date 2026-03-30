@@ -26,6 +26,39 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# CUDA device detection — probe once at import time
+# ---------------------------------------------------------------------------
+
+_USE_CUDA = False
+_cuda_stream: Optional[cv2.cuda.Stream] = None  # type: ignore[attr-defined]
+
+try:
+    if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        cv2.cuda.setDevice(0)
+        _cuda_stream = cv2.cuda.Stream()
+        # Smoke-test: upload a tiny mat and download it
+        _test = cv2.cuda.GpuMat()
+        _test.upload(np.zeros((2, 2), dtype=np.uint8))
+        _ = _test.download()
+        del _test
+        _USE_CUDA = True
+        logger.info(
+            "CUDA OpenCV enabled — device 0: %s",
+            cv2.cuda.getDevice(),
+        )
+    else:
+        logger.info("No CUDA-enabled OpenCV detected; stitcher will use CPU")
+except Exception as exc:
+    logger.warning("CUDA probe failed (%s); stitcher falling back to CPU", exc)
+
+
+def _to_gpu(mat: np.ndarray) -> cv2.cuda.GpuMat:  # type: ignore[attr-defined]
+    """Upload a numpy array to GPU memory."""
+    gpu = cv2.cuda.GpuMat()
+    gpu.upload(mat)
+    return gpu
+
+# ---------------------------------------------------------------------------
 # Lens distortion correction
 # ---------------------------------------------------------------------------
 
@@ -40,14 +73,13 @@ def undistort_frame(frame: np.ndarray, k1: float = -0.32, k2: float = 0.12) -> n
     the optical centre is at the image centre and focal length is
     approximately equal to the frame width (typical for PTZ cameras at
     moderate-to-high zoom).
+
+    When CUDA is available, uses GPU-accelerated remap for the undistortion.
     """
     if k1 == 0.0 and k2 == 0.0:
         return frame
 
     h, w = frame.shape[:2]
-    # Approximate focal length — at high zoom the FOV is narrow so
-    # f ≈ w is a reasonable starting estimate.  The exact value isn't
-    # critical because k1/k2 are tuned empirically to match.
     fx = fy = float(w)
     cx, cy = w / 2.0, h / 2.0
 
@@ -59,14 +91,31 @@ def undistort_frame(frame: np.ndarray, k1: float = -0.32, k2: float = 0.12) -> n
 
     dist_coeffs = np.array([k1, k2, 0, 0, 0], dtype=np.float64)
 
-    # getOptimalNewCameraMatrix with alpha=1 retains all pixels (no crop);
-    # alpha=0 crops aggressively.  We use 0.5 to balance: remove the worst
-    # barrel warp at the periphery while keeping most of the image.
     new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
         camera_matrix, dist_coeffs, (w, h), alpha=0.5,
     )
 
-    undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_camera_matrix)
+    if _USE_CUDA:
+        try:
+            # Compute remap tables on CPU (small), then remap on GPU (fast)
+            map1, map2 = cv2.initUndistortRectifyMap(
+                camera_matrix, dist_coeffs, None, new_camera_matrix,
+                (w, h), cv2.CV_32FC1,
+            )
+            gpu_frame = _to_gpu(frame)
+            gpu_map1 = _to_gpu(map1)
+            gpu_map2 = _to_gpu(map2)
+            gpu_result = cv2.cuda.remap(
+                gpu_frame, gpu_map1, gpu_map2,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+            undistorted = gpu_result.download()
+        except cv2.error:
+            undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_camera_matrix)
+    else:
+        undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_camera_matrix)
 
     # Crop to the valid ROI to remove black borders from remapping
     rx, ry, rw, rh = roi
@@ -81,11 +130,26 @@ def undistort_frame(frame: np.ndarray, k1: float = -0.32, k2: float = 0.12) -> n
 # ---------------------------------------------------------------------------
 
 def enhance_frame(frame: np.ndarray) -> np.ndarray:
-    """Boost contrast + brightness so ORB finds keypoints in dark frames."""
+    """Boost contrast + brightness so ORB finds keypoints in dark frames.
+
+    Uses CUDA-accelerated CLAHE when available.
+    """
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
+
+    if _USE_CUDA:
+        try:
+            clahe_gpu = cv2.cuda.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+            gpu_l = _to_gpu(l)
+            gpu_l_out = clahe_gpu.apply(gpu_l, cv2.cuda.Stream_Null())
+            l = gpu_l_out.download()
+        except cv2.error:
+            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+    else:
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+
     enhanced = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
     lut = np.array(
         [((i / 255.0) ** (1.0 / 2.0)) * 255 for i in range(256)],
@@ -100,6 +164,8 @@ def _brighten_output(img: np.ndarray) -> np.ndarray:
     Uses a global gamma correction for even brightness across the whole
     stitched image, plus CLAHE with a large tile grid scaled to the panorama
     size so that brightness is consistent across seams.
+
+    Uses CUDA CLAHE when available (the final panorama is large so this helps).
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
@@ -109,8 +175,19 @@ def _brighten_output(img: np.ndarray) -> np.ndarray:
     h, w = l.shape[:2]
     tile_w = max(1, w // 256)
     tile_h = max(1, h // 256)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
-    l = clahe.apply(l)
+
+    if _USE_CUDA:
+        try:
+            clahe_gpu = cv2.cuda.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
+            gpu_l = _to_gpu(l)
+            gpu_l_out = clahe_gpu.apply(gpu_l, cv2.cuda.Stream_Null())
+            l = gpu_l_out.download()
+        except cv2.error:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
+            l = clahe.apply(l)
+    else:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
+        l = clahe.apply(l)
 
     # Global gamma correction on L channel for uniform brightening
     lut = np.array(
@@ -132,6 +209,30 @@ _MIN_INLIERS   = 10
 _PHASE_CORR_MIN = 0.05          # minimum phase-correlation response to accept
 
 
+def _estimate_affine_cuda(
+    gray_a: np.ndarray,
+    gray_b: np.ndarray,
+) -> Tuple[Optional[list], Optional[np.ndarray], Optional[list], Optional[np.ndarray]]:
+    """Run ORB detect+compute on GPU.
+
+    Returns (kp_a, des_a, kp_b, des_b) as CPU objects ready for RANSAC.
+    The RANSAC step itself stays on CPU (tiny data, not worth GPU transfer).
+    """
+    orb_gpu = cv2.cuda.ORB_create(nfeatures=_ORB_FEATURES)
+    gpu_a = _to_gpu(gray_a)
+    gpu_b = _to_gpu(gray_b)
+
+    # detectAndCompute returns (list[KeyPoint], GpuMat) — keypoints are
+    # already on CPU, only descriptors live on GPU.
+    kp_a, des_a_gpu = orb_gpu.detectAndCompute(gpu_a, None)
+    kp_b, des_b_gpu = orb_gpu.detectAndCompute(gpu_b, None)
+
+    des_a = des_a_gpu.download() if des_a_gpu is not None and not des_a_gpu.empty() else None
+    des_b = des_b_gpu.download() if des_b_gpu is not None and not des_b_gpu.empty() else None
+
+    return kp_a, des_a, kp_b, des_b
+
+
 def _estimate_affine(
     frame_a: np.ndarray,
     frame_b: np.ndarray,
@@ -140,6 +241,8 @@ def _estimate_affine(
     Estimate the 2×3 affine transform that maps *frame_b* into *frame_a*'s
     coordinate system.  Returns a 3×3 matrix (with [0,0,1] bottom row) or
     None if matching fails.
+
+    Uses CUDA-accelerated ORB + BFMatcher when available.
     """
     h_a, w_a = frame_a.shape[:2]
     h_b, w_b = frame_b.shape[:2]
@@ -151,15 +254,39 @@ def _estimate_affine(
         gray_a = cv2.resize(gray_a, None, fx=scale, fy=scale)
         gray_b = cv2.resize(gray_b, None, fx=scale, fy=scale)
 
-    orb = cv2.ORB_create(nfeatures=_ORB_FEATURES)
-    kp_a, des_a = orb.detectAndCompute(gray_a, None)
-    kp_b, des_b = orb.detectAndCompute(gray_b, None)
+    if _USE_CUDA:
+        try:
+            kp_a, des_a, kp_b, des_b = _estimate_affine_cuda(gray_a, gray_b)
+        except cv2.error:
+            # Fallback to CPU on any CUDA error
+            kp_a, des_a, kp_b, des_b = None, None, None, None
+
+        if des_a is None or des_b is None or len(kp_a) < 4 or len(kp_b) < 4:
+            # Retry on CPU if GPU gave insufficient results
+            orb = cv2.ORB_create(nfeatures=_ORB_FEATURES)
+            kp_a, des_a = orb.detectAndCompute(gray_a, None)
+            kp_b, des_b = orb.detectAndCompute(gray_b, None)
+    else:
+        orb = cv2.ORB_create(nfeatures=_ORB_FEATURES)
+        kp_a, des_a = orb.detectAndCompute(gray_a, None)
+        kp_b, des_b = orb.detectAndCompute(gray_b, None)
 
     if des_a is None or des_b is None or len(kp_a) < 4 or len(kp_b) < 4:
         return None
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
-    raw_matches = bf.knnMatch(des_a, des_b, k=2)
+    # BFMatcher — GPU version for large descriptor sets
+    if _USE_CUDA and des_a.shape[0] >= 50 and des_b.shape[0] >= 50:
+        try:
+            bf_gpu = cv2.cuda.DescriptorMatcher_createBFMatcher(cv2.NORM_HAMMING)
+            gpu_des_a = _to_gpu(des_a)
+            gpu_des_b = _to_gpu(des_b)
+            raw_matches = bf_gpu.knnMatch(gpu_des_a, gpu_des_b, k=2)
+        except cv2.error:
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+            raw_matches = bf.knnMatch(des_a, des_b, k=2)
+    else:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        raw_matches = bf.knnMatch(des_a, des_b, k=2)
 
     good = []
     for m_pair in raw_matches:
@@ -604,6 +731,9 @@ def _composite_affine(
     Warp every frame using its accumulated affine transform and blend onto a
     single canvas.  Uses gain compensation to match brightness across frames
     and power-weighted distance-transform blending for seamless seams.
+
+    When CUDA is available, warpAffine runs on the GPU for a significant
+    speed-up (the canvas is large and there are many frames to warp).
     """
     all_corners = []
     for frame, H in zip(frames, transforms):
@@ -634,40 +764,76 @@ def _composite_affine(
         canvas_w = int(canvas_w * s)
         canvas_h = int(canvas_h * s)
 
-    logger.info(f"Canvas size: {canvas_w} x {canvas_h}")
+    logger.info(f"Canvas size: {canvas_w} x {canvas_h} (CUDA={'yes' if _USE_CUDA else 'no'})")
 
     # Compute per-frame gain compensation to match brightness across frames
     gains = _compute_gain_compensation(frames, transforms, canvas_w, canvas_h, T)
 
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
     weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+    kernel = np.ones((7, 7), np.uint8)
 
     for i, (frame, H) in enumerate(zip(frames, transforms)):
         H_final = T @ H
         A_final = H_final[:2, :]
 
-        warped = cv2.warpAffine(
-            frame, A_final, (canvas_w, canvas_h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
-        )
+        if _USE_CUDA:
+            try:
+                gpu_frame = _to_gpu(frame)
+                gpu_warped = cv2.cuda.warpAffine(
+                    gpu_frame, A_final, (canvas_w, canvas_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
+                warped = gpu_warped.download()
+
+                frame_mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+                gpu_mask = _to_gpu(frame_mask)
+                gpu_warped_mask = cv2.cuda.warpAffine(
+                    gpu_mask, A_final, (canvas_w, canvas_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                warped_mask = gpu_warped_mask.download()
+            except cv2.error:
+                # Fall through to CPU path
+                warped = cv2.warpAffine(
+                    frame, A_final, (canvas_w, canvas_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
+                frame_mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+                warped_mask = cv2.warpAffine(
+                    frame_mask, A_final, (canvas_w, canvas_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+        else:
+            warped = cv2.warpAffine(
+                frame, A_final, (canvas_w, canvas_h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+            frame_mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+            warped_mask = cv2.warpAffine(
+                frame_mask, A_final, (canvas_w, canvas_h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
 
         # Apply gain compensation
         warped = np.clip(warped.astype(np.float32) * gains[i], 0, 255).astype(np.uint8)
 
-        frame_mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
-        warped_mask = cv2.warpAffine(
-            frame_mask, A_final, (canvas_w, canvas_h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
         valid = (warped_mask > 128).astype(np.uint8)
 
         # Generous erosion removes edge artefacts from lens distortion,
         # vignetting, and warp-interpolation fringes that cause ghosting.
-        kernel = np.ones((7, 7), np.uint8)
         valid = cv2.erode(valid, kernel, iterations=6)
 
         dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5)
@@ -1073,6 +1239,14 @@ def _stitch_opencv(frames: List[np.ndarray]) -> Tuple[Optional[np.ndarray], str]
     # Try enhanced frames first (better keypoints in low light)
     enhanced = [enhance_frame(f) for f in unique]
     stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+    # When CUDA OpenCV is available, the high-level Stitcher can use
+    # GPU-accelerated feature detection and matching internally via
+    # ORB_CUDA / BFMatcher_CUDA.  We just need to set the features finder.
+    if _USE_CUDA:
+        try:
+            stitcher.setFeaturesFinder(cv2.cuda.ORB_create(_ORB_FEATURES))
+        except (cv2.error, AttributeError):
+            pass  # Fall back to default CPU features finder
     status, pano = stitcher.stitch(enhanced)
 
     if status == cv2.Stitcher_OK:
@@ -1125,11 +1299,18 @@ def stitch_frames(
     if len(frames) == 1:
         return frames[0], "single_frame"
 
-    # --- Automatic lens distortion correction (parallel) ---
-    logger.info(f"Applying lens undistortion to {len(frames)} frames")
-    n_workers = min(len(frames), os.cpu_count() or 4)
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        frames = list(pool.map(undistort_frame, frames))
+    # --- Automatic lens distortion correction ---
+    logger.info(
+        f"Applying lens undistortion to {len(frames)} frames "
+        f"(CUDA={'yes' if _USE_CUDA else 'no'})"
+    )
+    if _USE_CUDA:
+        # CUDA remap is not thread-safe — run sequentially on GPU
+        frames = [undistort_frame(f) for f in frames]
+    else:
+        n_workers = min(len(frames), os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            frames = list(pool.map(undistort_frame, frames))
 
     # Route to the correct algorithm based on scan mode
     if scan_mode == "preset" and grid_shape is not None:
