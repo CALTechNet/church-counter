@@ -70,8 +70,19 @@ def _get_model():
         _model = YOLO(model_name)
         # Move model to GPU if available
         if _device == "cuda":
-            _model.to(_device)
-            logger.info(f"YOLO model loaded on GPU: {model_name}")
+            try:
+                _model.to(_device)
+                # Warm-up forward pass to verify CUDA kernels work on this GPU
+                import torch
+                dummy = torch.zeros(1, 3, 32, 32, device=_device)
+                with torch.no_grad():
+                    _ = _model.model(dummy) if hasattr(_model, 'model') else None
+                logger.info(f"YOLO model loaded on GPU: {model_name}")
+            except (RuntimeError, torch.AcceleratorError) as e:
+                logger.warning(f"CUDA failed ({e}), falling back to CPU")
+                _device = "cpu"
+                _model = YOLO(model_name)  # reload on CPU
+                logger.info(f"YOLO model loaded on CPU (fallback): {model_name}")
         else:
             logger.info(f"YOLO model loaded on CPU: {model_name}")
     return _model
@@ -180,14 +191,29 @@ def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
         logger.info(f"  Batch {batch_num}/{n_batches}: "
                     f"tiles {batch_start + 1}–{batch_start + len(batch_tiles)}")
 
-        results = model(
-            batch_tiles,
-            classes=[0],
-            conf=confidence,
-            imgsz=YOLO_IMGSZ,
-            device=_device,
-            verbose=False,
-        )
+        try:
+            results = model(
+                batch_tiles,
+                classes=[0],
+                conf=confidence,
+                imgsz=YOLO_IMGSZ,
+                device=_device,
+                verbose=False,
+            )
+        except (RuntimeError, Exception) as e:
+            if _device == "cuda" and "CUDA" in str(e):
+                logger.warning(f"CUDA inference failed ({e}), retrying batch on CPU")
+                _device = "cpu"
+                results = model(
+                    batch_tiles,
+                    classes=[0],
+                    conf=confidence,
+                    imgsz=YOLO_IMGSZ,
+                    device="cpu",
+                    verbose=False,
+                )
+            else:
+                raise
 
         batch_hits = 0
         for result, (x_start, y_start) in zip(results, batch_offsets):
