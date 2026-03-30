@@ -7,11 +7,69 @@ Auto-counts congregation via PTZ camera + YOLO26x AI, with a mobile-responsive w
 ```bash
 # 1. Clone / copy this folder to your server
 # 2. (Optional) Drop your seats.svg into ./config/seats.svg
-# 3. Build and run
-docker compose up -d --build
+# 3. Build and run — auto-detects your CPU/GPU
+./build.sh
 
 # 4. Open the UI
 http://<server-ip>:80
+```
+
+The build script automatically detects your hardware (CPU type, core count, GPU) and selects the right Dockerfile and docker-compose configuration. No manual setup needed.
+
+## Build Script
+
+`build.sh` detects your hardware and builds + starts the appropriate Docker stack in one step.
+
+### Hardware Detection
+
+| Hardware | What it detects | Action |
+|---|---|---|
+| **Intel CPU** | `/proc/cpuinfo` vendor string | CPU build + suggests OpenVINO for 2-4× faster inference |
+| **AMD CPU** | `/proc/cpuinfo` vendor string | CPU build with core-scaled batch size |
+| **ARM / Apple Silicon** | `uname -m` (aarch64/arm64) | CPU build, skips GPU passthrough |
+| **NVIDIA GPU** | `nvidia-smi` + nvidia-container-toolkit | CUDA build with OpenCV compiled from source |
+| **AMD GPU** | `rocm-smi` + `/dev/kfd` + `/dev/dri` | ROCm build with OpenCV compiled from source |
+| **No GPU** | Fallback | CPU-only build |
+
+The script also auto-tunes `TILE_BATCH_SIZE` based on core count:
+
+| Cores | Batch Size |
+|---|---|
+| < 8 | 4 |
+| 8–15 | 8 |
+| 16+ | 12 |
+| Any GPU | 16 |
+
+### Usage
+
+```bash
+./build.sh              # auto-detect, build, and start
+./build.sh --gpu        # force NVIDIA CUDA build
+./build.sh --rocm       # force AMD ROCm build
+./build.sh --cpu        # force CPU-only build
+./build.sh --build-only # build without starting the container
+./build.sh --info       # show detected hardware and exit
+```
+
+### Docker Compose Files
+
+| File | Use case |
+|---|---|
+| `docker-compose.yml` | CPU-only (default) |
+| `docker-compose.gpu.yml` | NVIDIA CUDA |
+| `docker-compose.rocm.yml` | AMD ROCm |
+
+The build script selects the right one automatically. To manage the stack manually:
+
+```bash
+# CPU
+docker compose up -d --build
+
+# NVIDIA GPU
+docker compose -f docker-compose.gpu.yml up -d --build
+
+# AMD GPU
+docker compose -f docker-compose.rocm.yml up -d --build
 ```
 
 ## First Run Checklist
@@ -98,7 +156,7 @@ Single Docker container
 │   ├── WebSocket (/ws)  — live scan progress broadcast
 │   └── Static SPA       — React + Vite frontend
 ├── APScheduler          — 3 weekly cron jobs (America/Chicago)
-├── YOLO26x              — tiled person detection (CPU)
+├── YOLO26x              — tiled person detection (CPU or GPU)
 ├── OpenCV Stitcher      — panorama from captured frames
 └── SQLite (/data/church.db)
 ```
@@ -142,7 +200,7 @@ The frontend version is tracked in `frontend/src/version.js` as `v1.2.{BUILD}`. 
 
 To check the current version, look at the bottom-right footer of the UI.
 
-## Optional: OpenVINO Acceleration
+## Optional: OpenVINO Acceleration (Intel CPUs)
 
 For 2–4× faster inference on Intel CPUs, export the YOLO26x model to OpenVINO INT8 format:
 
@@ -151,6 +209,8 @@ bash export_openvino.sh
 ```
 
 This produces `./models/yolo26x_openvino_model/`. Then set `YOLO_MODEL=/models/yolo26x_openvino_model` in `docker-compose.yml`.
+
+The build script automatically suggests this when it detects an Intel CPU.
 
 ## Troubleshooting
 
@@ -163,3 +223,5 @@ This produces `./models/yolo26x_openvino_model/`. Then set `YOLO_MODEL=/models/y
 | Seats not coloring | Open Calibration wizard and mark ≥4 point pairs |
 | Scan stuck / spinner won't stop | Wait >5 min for the "✕ Reset" button to appear, or restart the container |
 | Per-seat colours wrong after SVG change | Re-run calibration — point mappings are tied to SVG coordinates |
+| Build script picks wrong GPU | Use `--gpu`, `--rocm`, or `--cpu` to force a specific build |
+| Slow inference on Intel CPU | Run `./export_openvino.sh` and set `YOLO_MODEL=/models/yolo26x_openvino_model` |
