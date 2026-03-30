@@ -21,8 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-RUN git clone --depth 1 --branch 4.9.0 https://github.com/opencv/opencv.git && \
-    git clone --depth 1 --branch 4.9.0 https://github.com/opencv/opencv_contrib.git
+RUN git clone --depth 1 --branch 4.10.0 https://github.com/opencv/opencv.git && \
+    git clone --depth 1 --branch 4.10.0 https://github.com/opencv/opencv_contrib.git
 
 WORKDIR /build/opencv/build
 
