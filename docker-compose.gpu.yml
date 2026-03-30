@@ -14,8 +14,6 @@ services:
       - ./data:/data          # SQLite database — persists between restarts
       - ./config:/config      # Drop your seats.svg here
       - ./models:/models      # Persisted YOLO model weights (incl. OpenVINO export)
-    mem_limit: 12g
-    memswap_limit: 12g
     environment:
       - PYTHONUNBUFFERED=1
       - TZ=America/Chicago
