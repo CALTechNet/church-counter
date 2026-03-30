@@ -15,7 +15,9 @@ Performance notes:
   - For CPU-only hosts, export to OpenVINO with export_openvino.sh (2-4x on Intel CPUs)
     then set YOLO_MODEL=/models/yolo26x_openvino_model in docker-compose.yml
   - Cross-tile NMS deduplication is still applied after merging all tile results
+  - Tiles are enhanced and built lazily per-batch to avoid OOM on large panoramas
 """
+import gc
 import logging
 import math
 import os
@@ -139,56 +141,64 @@ def _nms_detections(detections: List[Dict], iou_threshold: float = NMS_IOU) -> L
 
 
 # ── Tiled detection ────────────────────────────────────────────────────────────
-def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
-    """
-    Run YOLO26x on image using batched tiled inference.
-    Splits the panorama into a TILE_COLS x TILE_ROWS grid with TILE_OVERLAP overlap.
-    All tiles are submitted to YOLO in a single batched call (TILE_BATCH_SIZE at a time)
-    to minimise overhead on CPU, then coordinates are mapped back to full image space
-    and cross-tile NMS removes border duplicates.
-    Returns list of unique person detections in full image coordinates.
-    """
-    global _device
-    model    = _get_model()
-    h_orig, w_orig = image.shape[:2]
-    logger.info(f"Starting detection — image {w_orig}x{h_orig}, "
-                f"grid {TILE_COLS}x{TILE_ROWS}, conf≥{confidence}")
-
-    enhanced = enhance_image(image)
-    h, w     = enhanced.shape[:2]
-
+def _tile_offsets(h: int, w: int) -> List[Tuple[int, int, int, int]]:
+    """Pre-compute (x_start, y_start, x_end, y_end) for every tile without allocating pixels."""
     tile_w = int(w / (TILE_COLS - TILE_OVERLAP * (TILE_COLS - 1)))
     tile_h = int(h / (TILE_ROWS - TILE_OVERLAP * (TILE_ROWS - 1)))
     step_x = int(tile_w * (1 - TILE_OVERLAP))
     step_y = int(tile_h * (1 - TILE_OVERLAP))
 
-    # ── Build tile list ────────────────────────────────────────────────────────
-    tiles: List[np.ndarray] = []
-    offsets: List[Tuple[int, int]] = []  # (x_start, y_start) for each tile
-
+    regions: List[Tuple[int, int, int, int]] = []
     for row in range(TILE_ROWS):
         for col in range(TILE_COLS):
             x_start = col * step_x
             y_start = row * step_y
             x_end   = min(x_start + tile_w, w)
             y_end   = min(y_start + tile_h, h)
-            tile    = enhanced[y_start:y_end, x_start:x_end]
-            if tile.size == 0:
-                continue
-            tiles.append(tile)
-            offsets.append((x_start, y_start))
+            if (x_end - x_start) > 0 and (y_end - y_start) > 0:
+                regions.append((x_start, y_start, x_end, y_end))
+    return regions
 
-    n_batches = math.ceil(len(tiles) / TILE_BATCH_SIZE)
-    logger.info(f"Running batched inference on {len(tiles)} tiles "
+
+def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
+    """
+    Run YOLO26x on image using batched tiled inference.
+    Splits the panorama into a TILE_COLS x TILE_ROWS grid with TILE_OVERLAP overlap.
+    Tiles are built lazily per-batch and enhanced individually to avoid holding
+    the full enhanced panorama in memory (critical for large CPU-only panoramas).
+    Cross-tile NMS removes border duplicates.
+    Returns list of unique person detections in full image coordinates.
+    """
+    global _device
+    model    = _get_model()
+    h, w     = image.shape[:2]
+    logger.info(f"Starting detection — image {w}x{h}, "
+                f"grid {TILE_COLS}x{TILE_ROWS}, conf≥{confidence}")
+
+    # Pre-compute tile regions (coordinates only — no pixel data yet)
+    regions   = _tile_offsets(h, w)
+    n_tiles   = len(regions)
+    n_batches = math.ceil(n_tiles / TILE_BATCH_SIZE)
+    logger.info(f"Running batched inference on {n_tiles} tiles "
                 f"(batch size {TILE_BATCH_SIZE}, {n_batches} batch{'es' if n_batches != 1 else ''})")
 
-    # ── Batched YOLO inference ─────────────────────────────────────────────────
+    # ── Batched YOLO inference (lazy tile extraction) ─────────────────────────
     all_detections: List[Dict] = []
 
-    for batch_start in range(0, len(tiles), TILE_BATCH_SIZE):
-        batch_tiles   = tiles  [batch_start : batch_start + TILE_BATCH_SIZE]
-        batch_offsets = offsets[batch_start : batch_start + TILE_BATCH_SIZE]
-        batch_num     = batch_start // TILE_BATCH_SIZE + 1
+    for batch_idx in range(n_batches):
+        batch_start  = batch_idx * TILE_BATCH_SIZE
+        batch_regions = regions[batch_start : batch_start + TILE_BATCH_SIZE]
+        batch_num     = batch_idx + 1
+
+        # Extract and enhance only the tiles needed for this batch
+        batch_tiles:   List[np.ndarray]       = []
+        batch_offsets: List[Tuple[int, int]]   = []
+        for (x_start, y_start, x_end, y_end) in batch_regions:
+            tile = image[y_start:y_end, x_start:x_end].copy()
+            tile = enhance_image(tile)
+            batch_tiles.append(tile)
+            batch_offsets.append((x_start, y_start))
+
         logger.info(f"  Batch {batch_num}/{n_batches}: "
                     f"tiles {batch_start + 1}–{batch_start + len(batch_tiles)}")
 
@@ -233,12 +243,16 @@ def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
                 batch_hits += 1
         logger.info(f"  Batch {batch_num}/{n_batches}: {batch_hits} raw detections")
 
+        # Free batch memory before next iteration
+        del batch_tiles, results
+        gc.collect()
+
     if all_detections:
         confs = [d["confidence"] for d in all_detections]
         logger.info(f"Batched detection: {len(all_detections)} raw detections across "
-                    f"{len(tiles)} tiles (conf min={min(confs):.2f} avg={sum(confs)/len(confs):.2f} max={max(confs):.2f})")
+                    f"{n_tiles} tiles (conf min={min(confs):.2f} avg={sum(confs)/len(confs):.2f} max={max(confs):.2f})")
     else:
-        logger.info(f"Batched detection: 0 raw detections across {len(tiles)} tiles")
+        logger.info(f"Batched detection: 0 raw detections across {n_tiles} tiles")
 
     # ── Cross-tile deduplication ───────────────────────────────────────────────
     detections = _nms_detections(all_detections)
