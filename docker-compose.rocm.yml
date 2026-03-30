@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  attendance:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+    container_name: church-attendance
+    restart: unless-stopped
+    ports:
+      - "80:8000"
+    volumes:
+      - ./data:/data
+      - ./config:/config
+      - ./models:/models
+    mem_limit: 12g
+    memswap_limit: 12g
+    # AMD GPU device passthrough — requires amdgpu kernel driver on host
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Chicago
+      - TILE_BATCH_SIZE=16
+      - YOLO_IMGSZ=640
+      - ROCR_VISIBLE_DEVICES=all
+      # OPENCV_THREAD_COUNT=0 means "use all cores"; OMP/OPENBLAS unset = same default
+      - OPENCV_THREAD_COUNT=0
+    network_mode: bridge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

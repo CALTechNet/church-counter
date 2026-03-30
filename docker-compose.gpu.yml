@@ -25,10 +25,8 @@ services:
       - YOLO_IMGSZ=640
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      # Let OpenCV use all available CPU cores for stitching
+      # OPENCV_THREAD_COUNT=0 means "use all cores"; OMP/OPENBLAS unset = same default
       - OPENCV_THREAD_COUNT=0
-      - OMP_NUM_THREADS=0
-      - OPENBLAS_NUM_THREADS=0
     network_mode: bridge
     extra_hosts:
       - "host.docker.internal:host-gateway"

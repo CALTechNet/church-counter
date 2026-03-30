@@ -34,7 +34,7 @@ def _log_hardware_info():
         import torch
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
-            vram = torch.cuda.get_device_properties(0).total_mem / 1024 / 1024
+            vram = torch.cuda.get_device_properties(0).total_memory / 1024 / 1024
             logger.info(f"Hardware: GPU acceleration enabled — {gpu_name} ({vram:.0f} MB VRAM)")
             logger.info(f"Hardware: CUDA {torch.version.cuda}, PyTorch {torch.__version__}")
         else:

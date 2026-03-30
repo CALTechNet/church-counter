@@ -20,10 +20,8 @@ services:
       # YOLO memory tuning — lower these if the container still OOMs
       - TILE_BATCH_SIZE=4   # tiles processed per YOLO call (raise to 8-12 on 16 GB+ hosts)
       - YOLO_IMGSZ=640      # inference image size per tile (1280 for higher accuracy)
-      # Let OpenCV use all available CPU cores for stitching
+      # OPENCV_THREAD_COUNT=0 means "use all cores"; OMP/OPENBLAS unset = same default
       - OPENCV_THREAD_COUNT=0
-      - OMP_NUM_THREADS=0
-      - OPENBLAS_NUM_THREADS=0
     network_mode: bridge      # Must reach camera at 10.10.140.140
     extra_hosts:
       - "host.docker.internal:host-gateway"
