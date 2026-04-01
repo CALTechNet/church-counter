@@ -132,27 +132,43 @@ def undistort_frame(frame: np.ndarray, k1: float = -0.32, k2: float = 0.12) -> n
 def enhance_frame(frame: np.ndarray) -> np.ndarray:
     """Boost contrast + brightness so ORB finds keypoints in dark frames.
 
+    Adapts enhancement strength to frame brightness: very dark frames get
+    stronger CLAHE and gamma correction to pull out features that would
+    otherwise be invisible to ORB / template matching.
+
     Uses CUDA-accelerated CLAHE when available.
     """
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
+    # Adapt CLAHE strength to frame brightness — dark frames need more help
+    mean_l = float(l.mean())
+    if mean_l < 50:
+        clip_limit = 6.0   # very dark — aggressive contrast boost
+        gamma = 2.5
+    elif mean_l < 90:
+        clip_limit = 5.0   # dim — moderate-strong boost
+        gamma = 2.2
+    else:
+        clip_limit = 4.0   # normal / well-lit
+        gamma = 2.0
+
     if _USE_CUDA:
         try:
-            clahe_gpu = cv2.cuda.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+            clahe_gpu = cv2.cuda.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
             gpu_l = _to_gpu(l)
             gpu_l_out = clahe_gpu.apply(gpu_l, cv2.cuda.Stream_Null())
             l = gpu_l_out.download()
         except cv2.error:
-            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
             l = clahe.apply(l)
     else:
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
         l = clahe.apply(l)
 
     enhanced = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
     lut = np.array(
-        [((i / 255.0) ** (1.0 / 2.0)) * 255 for i in range(256)],
+        [((i / 255.0) ** (1.0 / gamma)) * 255 for i in range(256)],
         dtype=np.uint8,
     )
     return cv2.LUT(enhanced, lut)
@@ -206,7 +222,7 @@ _ORB_FEATURES  = 3000
 _MATCH_RATIO   = 0.75
 _RANSAC_REPROJ = 5.0
 _MIN_INLIERS   = 10
-_PHASE_CORR_MIN = 0.05          # minimum phase-correlation response to accept
+_PHASE_CORR_MIN = 0.02          # minimum phase-correlation response to accept (low for dark scenes)
 
 
 def _estimate_affine_cuda(
@@ -692,7 +708,7 @@ def _compute_gain_compensation(
                 continue
             mean_i = gray_warped[i][overlap > 0].mean()
             mean_j = gray_warped[j][overlap > 0].mean()
-            if mean_i < 1 or mean_j < 1:
+            if mean_i < 0.1 or mean_j < 0.1:
                 continue
             # We want gain[i]*mean_i = gain[j]*mean_j
             # => gain[i]*mean_i - gain[j]*mean_j = 0
@@ -715,13 +731,56 @@ def _compute_gain_compensation(
 
     gains, _, _, _ = np.linalg.lstsq(A_mat, b_vec, rcond=None)
 
-    # Clamp to reasonable range
-    gains = np.clip(gains, 0.5, 2.0)
+    # Clamp to reasonable range — wide enough to handle dramatic lighting
+    # changes (e.g. house lights up in some areas, dim in others).
+    gains = np.clip(gains, 0.2, 4.0)
     # Renormalize so mean is 1
     gains /= gains.mean()
 
     logger.info(f"Gain compensation: min={gains.min():.3f} max={gains.max():.3f}")
     return gains
+
+
+def _normalize_exposures(frames: List[np.ndarray]) -> List[np.ndarray]:
+    """Normalize per-frame brightness so all frames share a similar mean luminance.
+
+    Converts each frame to LAB, measures the mean L value, and applies a
+    per-frame affine mapping on L so that every frame's mean matches the
+    global median.  This brings dark and bright frames much closer in
+    exposure *before* the global gain compensation and blending steps,
+    dramatically reducing visible seams when lighting varies.
+    """
+    if len(frames) <= 1:
+        return frames
+
+    # Measure mean luminance of each frame
+    means = []
+    for f in frames:
+        l_ch = cv2.cvtColor(f, cv2.COLOR_BGR2LAB)[:, :, 0]
+        means.append(float(l_ch.mean()))
+
+    target = float(np.median(means))
+    if target < 1:
+        return frames  # all frames are nearly black, nothing to normalise
+
+    out = []
+    for f, m in zip(frames, means):
+        if m < 1 or abs(m - target) < 3:
+            # Already close enough, or too dark to normalise safely
+            out.append(f)
+            continue
+        ratio = target / m
+        # Clamp ratio to avoid extreme corrections on very dark frames
+        ratio = max(0.3, min(ratio, 4.0))
+        lab = cv2.cvtColor(f, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lab[:, :, 0] = np.clip(lab[:, :, 0] * ratio, 0, 255)
+        out.append(cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR))
+
+    logger.info(
+        f"Exposure normalization: frame L means {min(means):.0f}–{max(means):.0f} "
+        f"→ target {target:.0f}"
+    )
+    return out
 
 
 def _composite_affine(
@@ -730,12 +789,17 @@ def _composite_affine(
 ) -> np.ndarray:
     """
     Warp every frame using its accumulated affine transform and blend onto a
-    single canvas.  Uses gain compensation to match brightness across frames
-    and power-weighted distance-transform blending for seamless seams.
+    single canvas.  Uses per-frame exposure normalization and gain compensation
+    to match brightness across frames, with power-weighted distance-transform
+    blending for seamless seams.
 
     When CUDA is available, warpAffine runs on the GPU for a significant
     speed-up (the canvas is large and there are many frames to warp).
     """
+    # Normalize per-frame brightness before compositing so dark and
+    # bright frames are brought closer together in exposure.
+    frames = _normalize_exposures(frames)
+
     all_corners = []
     for frame, H in zip(frames, transforms):
         h, w = frame.shape[:2]
@@ -833,16 +897,19 @@ def _composite_affine(
 
         valid = (warped_mask > 128).astype(np.uint8)
 
-        # Generous erosion removes edge artefacts from lens distortion,
+        # Erosion removes edge artefacts from lens distortion,
         # vignetting, and warp-interpolation fringes that cause ghosting.
-        valid = cv2.erode(valid, kernel, iterations=6)
+        # 3 iterations with a 7×7 kernel removes ~21px from each edge —
+        # enough to hide interpolation fringes without creating black gaps.
+        valid = cv2.erode(valid, kernel, iterations=3)
 
         dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5)
 
         # Power-weight the distance so centre pixels dominate strongly;
-        # exponent 3.0 gives a very narrow transition zone that hides
-        # residual misalignment (ghosting) in overlap regions.
-        dist = np.power(dist, 3.0)
+        # exponent 2.0 gives a moderate transition zone that hides
+        # residual misalignment while blending exposure differences
+        # smoothly across overlap regions.
+        dist = np.power(dist, 2.0)
 
         canvas += warped.astype(np.float32) * dist[:, :, None]
         weight += dist
