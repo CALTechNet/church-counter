@@ -359,7 +359,7 @@ export default function App() {
         {tab === 0 && <PhotoView imageB64={imageB64} rawImageB64={rawImageB64} zoomImageB64={zoomImageB64} scanning={scanState.running} />}
         {tab === 1 && <AttendanceGraph />}
         {tab === 2 && <DataTable />}
-        {tab === 3 && <LiveView scanning={scanState.running} ptzPos={ptzPos} />}
+        {tab === 3 && <LiveView scanning={scanState.running} ptzPos={ptzPos} scanProgress={scanState.progress} totalPositions={totalPositions} />}
       </main>
 
       {/* Calibration modal */}
