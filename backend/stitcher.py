@@ -648,6 +648,78 @@ def _match_pair(
 # Canvas compositing with affine warping and blending
 # ---------------------------------------------------------------------------
 
+def _warp_frame_for_gain(args):
+    """Warp a single frame to quarter-res grayscale + mask for gain compensation.
+
+    Runs on CPU.  OpenCV releases the GIL during cvtColor / warpAffine so
+    multiple calls benefit from ThreadPoolExecutor concurrency.
+    """
+    frame, A_final, sw, sh, kernel = args
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    w_g = cv2.warpAffine(g, A_final, (sw, sh),
+                         flags=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    m = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+    w_m = cv2.warpAffine(m, A_final, (sw, sh),
+                         flags=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    valid = (w_m > 128).astype(np.uint8)
+    valid = cv2.erode(valid, kernel, iterations=1)
+
+    return w_g.astype(np.float64), valid
+
+
+def _warp_frame_for_gain_cuda(args):
+    """Warp a single frame to quarter-res grayscale + mask using CUDA.
+
+    CUDA warpAffine is called sequentially (not thread-safe) but is still
+    faster than the CPU path because each warp runs on the GPU.
+    """
+    frame, A_final, sw, sh, kernel = args
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gpu_g = _to_gpu(g)
+    gpu_wg = cv2.cuda.warpAffine(
+        gpu_g, A_final, (sw, sh),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    w_g = gpu_wg.download()
+
+    m = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+    gpu_m = _to_gpu(m)
+    gpu_wm = cv2.cuda.warpAffine(
+        gpu_m, A_final, (sw, sh),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    w_m = gpu_wm.download()
+
+    valid = (w_m > 128).astype(np.uint8)
+    valid = cv2.erode(valid, kernel, iterations=1)
+
+    return w_g.astype(np.float64), valid
+
+
+def _compute_overlap_equation(args):
+    """Compute a single overlap equation for the gain least-squares system."""
+    i, j, gray_i, gray_j, mask_i, mask_j, n = args
+    overlap = mask_i & mask_j
+    count = int(overlap.sum())
+    if count < 100:
+        return None
+    mean_i = gray_i[overlap > 0].mean()
+    mean_j = gray_j[overlap > 0].mean()
+    if mean_i < 0.1 or mean_j < 0.1:
+        return None
+    row = np.zeros(n, dtype=np.float64)
+    row[i] = mean_i
+    row[j] = -mean_j
+    return (row, 0.0)
+
+
 def _compute_gain_compensation(
     frames: List[np.ndarray],
     transforms: List[np.ndarray],
@@ -661,6 +733,10 @@ def _compute_gain_compensation(
     the overlap zone and solve a least-squares system to find a single scalar
     gain per frame that minimises brightness differences across all overlaps.
     Returns an array of shape (n_frames,) with gain multipliers.
+
+    The frame warping step is parallelised: via CUDA when available (sequential
+    GPU calls, still faster than CPU), otherwise via ThreadPoolExecutor across
+    CPU cores.  The overlap equation building is also parallelised on CPU.
     """
     n = len(frames)
     if n <= 1:
@@ -672,51 +748,61 @@ def _compute_gain_compensation(
     sh = max(1, int(canvas_h * scale))
     S = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]], dtype=np.float64)
 
-    gray_warped = []
-    masks = []
     kernel = np.ones((3, 3), np.uint8)
 
+    # Pre-compute affine matrices for quarter-res canvas
+    warp_args = []
     for frame, H in zip(frames, transforms):
         H_final = S @ T @ H
         A_final = H_final[:2, :]
+        warp_args.append((frame, A_final, sw, sh, kernel))
 
-        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        w_g = cv2.warpAffine(g, A_final, (sw, sh),
-                             flags=cv2.INTER_LINEAR,
-                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # --- Parallel warp: CUDA (sequential GPU) or threaded CPU ---
+    if _USE_CUDA:
+        # CUDA warpAffine is not thread-safe — run sequentially on GPU
+        logger.debug("Gain compensation: warping %d frames on CUDA", n)
+        try:
+            results = [_warp_frame_for_gain_cuda(a) for a in warp_args]
+        except cv2.error:
+            logger.debug("CUDA warp failed in gain comp; falling back to CPU threads")
+            n_workers = min(n, os.cpu_count() or 4)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                results = list(pool.map(_warp_frame_for_gain, warp_args))
+    else:
+        n_workers = min(n, os.cpu_count() or 4)
+        logger.debug("Gain compensation: warping %d frames on %d CPU threads", n, n_workers)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(_warp_frame_for_gain, warp_args))
 
-        m = np.ones(frame.shape[:2], dtype=np.uint8) * 255
-        w_m = cv2.warpAffine(m, A_final, (sw, sh),
-                             flags=cv2.INTER_LINEAR,
-                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        valid = (w_m > 128).astype(np.uint8)
-        valid = cv2.erode(valid, kernel, iterations=1)
-
-        gray_warped.append(w_g.astype(np.float64))
-        masks.append(valid)
+    gray_warped = [r[0] for r in results]
+    masks = [r[1] for r in results]
 
     # Build equations: for each overlapping pair, gain[i]*mean_i ≈ gain[j]*mean_j
     # We solve via least-squares with the constraint that mean gain = 1.
+    # Parallelise the overlap computations across CPU threads.
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairs.append((i, j, gray_warped[i], gray_warped[j],
+                          masks[i], masks[j], n))
+
     A_rows = []
     b_rows = []
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            overlap = masks[i] & masks[j]
-            count = int(overlap.sum())
-            if count < 100:
-                continue
-            mean_i = gray_warped[i][overlap > 0].mean()
-            mean_j = gray_warped[j][overlap > 0].mean()
-            if mean_i < 0.1 or mean_j < 0.1:
-                continue
-            # We want gain[i]*mean_i = gain[j]*mean_j
-            # => gain[i]*mean_i - gain[j]*mean_j = 0
-            row = np.zeros(n, dtype=np.float64)
-            row[i] = mean_i
-            row[j] = -mean_j
-            A_rows.append(row)
-            b_rows.append(0.0)
+    if len(pairs) > 4:
+        n_workers = min(len(pairs), os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            eq_results = list(pool.map(_compute_overlap_equation, pairs))
+        for eq in eq_results:
+            if eq is not None:
+                A_rows.append(eq[0])
+                b_rows.append(eq[1])
+    else:
+        for p in pairs:
+            eq = _compute_overlap_equation(p)
+            if eq is not None:
+                A_rows.append(eq[0])
+                b_rows.append(eq[1])
 
     if not A_rows:
         return np.ones(n, dtype=np.float64)
