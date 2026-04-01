@@ -533,14 +533,15 @@ def _match_pair(
     candidates: list = []
 
     # Maximum distance (pixels) a feature match can deviate from the
-    # expected offset before it's rejected.  30 % of the frame dimension
-    # along the stitching axis gives enough room for genuine refinement
-    # but rejects wildly wrong matches.
+    # expected offset before it's rejected.  70 % of the frame dimension
+    # along the stitching axis accommodates a wide range of actual
+    # overlaps (the expected offset is calibrated from phase correlation
+    # but may still be imperfect).
     if expected_offset is not None:
         if fallback_direction == "horizontal":
-            max_deviation = w * 0.30
+            max_deviation = w * 0.70
         else:
-            max_deviation = h * 0.30
+            max_deviation = h * 0.70
     else:
         max_deviation = float("inf")
 
@@ -931,16 +932,41 @@ def _estimate_expected_offsets(
     Returns a list of (dx, dy) tuples, one per consecutive pair.
     If positions are not available, returns a list of Nones.
 
-    The conversion from pan/tilt units to pixels is estimated by assuming
-    the total position range maps to roughly ``(1 - overlap) * n_frames``
-    frame widths/heights, with ~35 % overlap.
+    The overlap factor is calibrated empirically by running phase
+    correlation on the first pair of frames, so it adapts to the actual
+    camera zoom / FOV rather than relying on a hardcoded assumption.
+    Cross-axis components (dy for horizontal, dx for vertical) are zeroed
+    to prevent accumulated drift from numerical noise in positions.
     """
     n = len(frames)
     if positions is None or len(positions) != n:
         return [None] * max(0, n - 1)
 
     h, w = frames[0].shape[:2]
-    overlap = 0.35
+
+    # --- Calibrate overlap from the first pair via phase correlation ---
+    overlap = 0.35  # fallback default
+    if n >= 2:
+        pc = _phase_correlation_affine(frames[0], frames[1], direction=direction)
+        if pc is not None:
+            if direction == "horizontal":
+                measured = abs(pc[0, 2])
+                if measured > 0.03 * w:
+                    overlap = 1.0 - measured / w
+                    overlap = max(0.05, min(0.95, overlap))
+                    logger.info(
+                        f"Calibrated horizontal overlap from phase correlation: "
+                        f"{overlap:.0%} (offset {measured:.0f}px / {w}px)"
+                    )
+            else:
+                measured = abs(pc[1, 2])
+                if measured > 0.03 * h:
+                    overlap = 1.0 - measured / h
+                    overlap = max(0.05, min(0.95, overlap))
+                    logger.info(
+                        f"Calibrated vertical overlap from phase correlation: "
+                        f"{overlap:.0%} (offset {measured:.0f}px / {h}px)"
+                    )
 
     if direction == "horizontal":
         # Compute pan range
@@ -953,8 +979,9 @@ def _estimate_expected_offsets(
         offsets = []
         for i in range(n - 1):
             dp = positions[i + 1][0] - positions[i][0]
-            dt = positions[i + 1][1] - positions[i][1]
-            offsets.append((dp * pixels_per_pan, dt * pixels_per_pan))
+            # Zero out cross-axis component to prevent vertical drift
+            # within a horizontal row (all frames share the same tilt).
+            offsets.append((dp * pixels_per_pan, 0.0))
         return offsets
     else:
         # Compute tilt range
@@ -965,13 +992,14 @@ def _estimate_expected_offsets(
         pixels_per_tilt = (h * (1 - overlap)) * (n - 1) / tilt_range if tilt_range else 1
         offsets = []
         for i in range(n - 1):
-            dp = positions[i + 1][0] - positions[i][0]
             dt = positions[i + 1][1] - positions[i][1]
             # Rows are ordered top→bottom in the grid, so each subsequent
             # row strip should be BELOW the previous one (positive dy).
             # Some cameras have inverted tilt (higher value = looking up),
             # so use abs(dt) to guarantee downward progression.
-            offsets.append((dp * pixels_per_tilt, abs(dt) * pixels_per_tilt))
+            # Zero out cross-axis (pan) component to prevent horizontal
+            # staircase drift between rows.
+            offsets.append((0.0, abs(dt) * pixels_per_tilt))
         return offsets
 
 
