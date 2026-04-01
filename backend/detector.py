@@ -203,26 +203,31 @@ def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
                     f"tiles {batch_start + 1}–{batch_start + len(batch_tiles)}")
 
         try:
-            results = model(
-                batch_tiles,
-                classes=[0],
-                conf=confidence,
-                imgsz=YOLO_IMGSZ,
-                device=_device,
-                verbose=False,
-            )
-        except (RuntimeError, Exception) as e:
-            if _device == "cuda" and "CUDA" in str(e):
-                logger.warning(f"CUDA inference failed ({e}), retrying batch on CPU")
-                _device = "cpu"
+            with torch.no_grad():
                 results = model(
                     batch_tiles,
                     classes=[0],
                     conf=confidence,
                     imgsz=YOLO_IMGSZ,
-                    device="cpu",
+                    device=_device,
                     verbose=False,
                 )
+        except (RuntimeError, Exception) as e:
+            if _device == "cuda" and "CUDA" in str(e):
+                logger.warning(f"CUDA inference failed ({e}), retrying batch on CPU")
+                _device = "cpu"
+                # Move model off GPU to reclaim VRAM
+                model.to("cpu")
+                torch.cuda.empty_cache()
+                with torch.no_grad():
+                    results = model(
+                        batch_tiles,
+                        classes=[0],
+                        conf=confidence,
+                        imgsz=YOLO_IMGSZ,
+                        device="cpu",
+                        verbose=False,
+                    )
             else:
                 raise
 
@@ -245,6 +250,8 @@ def detect_people(image: np.ndarray, confidence: float = 0.30) -> List[Dict]:
 
         # Free batch memory before next iteration
         del batch_tiles, results
+        if _device == "cuda":
+            torch.cuda.empty_cache()
         gc.collect()
 
     if all_detections:
