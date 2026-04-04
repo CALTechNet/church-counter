@@ -43,7 +43,9 @@ try:
         del _test
         _USE_CUDA = True
         logger.info(
-            "CUDA OpenCV enabled — device 0: %s",
+            "CUDA OpenCV enabled — device 0: %s  "
+            "(ORB, BFMatcher, remap, CLAHE, warpAffine, templateMatch, "
+            "DFT phase-correlation, morphology, cvtColor, calcHist, jpegEncode)",
             cv2.cuda.getDevice(),
         )
     else:
@@ -136,8 +138,43 @@ def enhance_frame(frame: np.ndarray) -> np.ndarray:
     stronger CLAHE and gamma correction to pull out features that would
     otherwise be invisible to ORB / template matching.
 
-    Uses CUDA-accelerated CLAHE when available.
+    Uses CUDA-accelerated cvtColor + CLAHE + LUT when available.
     """
+    if _USE_CUDA:
+        try:
+            gpu_frame = _to_gpu(frame)
+            gpu_lab = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2LAB)
+            lab = gpu_lab.download()
+            l, a, b = cv2.split(lab)
+
+            mean_l = float(l.mean())
+            if mean_l < 50:
+                clip_limit, gamma = 6.0, 2.5
+            elif mean_l < 90:
+                clip_limit, gamma = 5.0, 2.2
+            else:
+                clip_limit, gamma = 4.0, 2.0
+
+            clahe_gpu = cv2.cuda.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+            gpu_l = _to_gpu(l)
+            gpu_l_out = clahe_gpu.apply(gpu_l, cv2.cuda.Stream_Null())
+            l = gpu_l_out.download()
+
+            merged = cv2.merge((l, a, b))
+            gpu_merged = _to_gpu(merged)
+            gpu_enhanced = cv2.cuda.cvtColor(gpu_merged, cv2.COLOR_LAB2BGR)
+
+            lut = np.array(
+                [((i / 255.0) ** (1.0 / gamma)) * 255 for i in range(256)],
+                dtype=np.uint8,
+            )
+            # Apply LUT on GPU
+            gpu_lut = _to_gpu(lut)
+            enhanced = gpu_enhanced.download()
+            return cv2.LUT(enhanced, lut)
+        except cv2.error:
+            pass  # Fall through to CPU path
+
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
@@ -153,18 +190,8 @@ def enhance_frame(frame: np.ndarray) -> np.ndarray:
         clip_limit = 4.0   # normal / well-lit
         gamma = 2.0
 
-    if _USE_CUDA:
-        try:
-            clahe_gpu = cv2.cuda.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-            gpu_l = _to_gpu(l)
-            gpu_l_out = clahe_gpu.apply(gpu_l, cv2.cuda.Stream_Null())
-            l = gpu_l_out.download()
-        except cv2.error:
-            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-            l = clahe.apply(l)
-    else:
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-        l = clahe.apply(l)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    l = clahe.apply(l)
 
     enhanced = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
     lut = np.array(
@@ -181,8 +208,38 @@ def _brighten_output(img: np.ndarray) -> np.ndarray:
     stitched image, plus CLAHE with a large tile grid scaled to the panorama
     size so that brightness is consistent across seams.
 
-    Uses CUDA CLAHE when available (the final panorama is large so this helps).
+    Uses CUDA cvtColor + CLAHE when available (the final panorama is large
+    so GPU acceleration provides a significant speed-up here).
     """
+    if _USE_CUDA:
+        try:
+            gpu_img = _to_gpu(img)
+            gpu_lab = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2LAB)
+            lab = gpu_lab.download()
+            l, a, b = cv2.split(lab)
+
+            h, w = l.shape[:2]
+            tile_w = max(1, w // 256)
+            tile_h = max(1, h // 256)
+
+            clahe_gpu = cv2.cuda.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
+            gpu_l = _to_gpu(l)
+            gpu_l_out = clahe_gpu.apply(gpu_l, cv2.cuda.Stream_Null())
+            l = gpu_l_out.download()
+
+            lut = np.array(
+                [((i / 255.0) ** (1.0 / 1.8)) * 255 for i in range(256)],
+                dtype=np.uint8,
+            )
+            l = cv2.LUT(l, lut)
+
+            merged = cv2.merge((l, a, b))
+            gpu_merged = _to_gpu(merged)
+            gpu_result = cv2.cuda.cvtColor(gpu_merged, cv2.COLOR_LAB2BGR)
+            return gpu_result.download()
+        except cv2.error:
+            pass  # Fall through to CPU path
+
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
@@ -192,18 +249,8 @@ def _brighten_output(img: np.ndarray) -> np.ndarray:
     tile_w = max(1, w // 256)
     tile_h = max(1, h // 256)
 
-    if _USE_CUDA:
-        try:
-            clahe_gpu = cv2.cuda.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
-            gpu_l = _to_gpu(l)
-            gpu_l_out = clahe_gpu.apply(gpu_l, cv2.cuda.Stream_Null())
-            l = gpu_l_out.download()
-        except cv2.error:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
-            l = clahe.apply(l)
-    else:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
-        l = clahe.apply(l)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
+    l = clahe.apply(l)
 
     # Global gamma correction on L channel for uniform brightening
     lut = np.array(
@@ -264,8 +311,20 @@ def _estimate_affine(
     h_b, w_b = frame_b.shape[:2]
     scale = min(1.0, 800.0 / max(h_a, w_a, h_b, w_b))
 
-    gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
-    gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+    # BGR→Gray conversion on GPU when available
+    if _USE_CUDA:
+        try:
+            gpu_a = _to_gpu(frame_a)
+            gpu_b = _to_gpu(frame_b)
+            gray_a = cv2.cuda.cvtColor(gpu_a, cv2.COLOR_BGR2GRAY).download()
+            gray_b = cv2.cuda.cvtColor(gpu_b, cv2.COLOR_BGR2GRAY).download()
+        except cv2.error:
+            gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
+            gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
+        gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+
     if scale < 1.0:
         gray_a = cv2.resize(gray_a, None, fx=scale, fy=scale)
         gray_b = cv2.resize(gray_b, None, fx=scale, fy=scale)
@@ -347,7 +406,12 @@ def _template_affine(
     frame_a: np.ndarray,
     frame_b: np.ndarray,
 ) -> Optional[np.ndarray]:
-    """Fallback: pure-translation affine via template matching."""
+    """Fallback: pure-translation affine via template matching.
+
+    Uses CUDA-accelerated template matching when available — the
+    cross-correlation runs entirely on the GPU, which is significantly
+    faster for the large search images typical of panorama stitching.
+    """
     h_a, w_a = frame_a.shape[:2]
     h_b, w_b = frame_b.shape[:2]
 
@@ -371,8 +435,22 @@ def _template_affine(
     if template.shape[0] > gray_a.shape[0] or template.shape[1] > gray_a.shape[1]:
         return None
 
-    res = cv2.matchTemplate(gray_a, template, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if _USE_CUDA:
+        try:
+            gpu_image = _to_gpu(gray_a)
+            gpu_templ = _to_gpu(template)
+            matcher = cv2.cuda.createTemplateMatching(
+                cv2.CV_8U, cv2.TM_CCOEFF_NORMED,
+            )
+            gpu_res = matcher.match(gpu_image, gpu_templ)
+            res = gpu_res.download()
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        except cv2.error:
+            res = cv2.matchTemplate(gray_a, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    else:
+        res = cv2.matchTemplate(gray_a, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
     if max_val < 0.25:
         return None
@@ -390,6 +468,67 @@ def _template_affine(
     return H
 
 
+def _phase_correlate_cuda(
+    windowed_a: np.ndarray,
+    windowed_b: np.ndarray,
+) -> Tuple[Tuple[float, float], float]:
+    """GPU-accelerated phase correlation using CUDA DFT.
+
+    Computes the cross-power spectrum on the GPU and finds the peak in
+    the inverse DFT to determine the translation between two images.
+    Returns ((dx, dy), response) matching cv2.phaseCorrelate's interface.
+    """
+    h, w = windowed_a.shape[:2]
+
+    # Convert to float32 two-channel (real, imag=0) for cuda.dft
+    a_f32 = windowed_a.astype(np.float32)
+    b_f32 = windowed_b.astype(np.float32)
+
+    gpu_a = _to_gpu(a_f32)
+    gpu_b = _to_gpu(b_f32)
+
+    # Forward DFT on GPU
+    gpu_dft_a = cv2.cuda.dft(gpu_a, (h, w), flags=cv2.DFT_COMPLEX_OUTPUT)
+    gpu_dft_b = cv2.cuda.dft(gpu_b, (h, w), flags=cv2.DFT_COMPLEX_OUTPUT)
+
+    # Cross-power spectrum: conj(A) * B / |conj(A) * B|
+    gpu_cross = cv2.cuda.mulSpectrums(gpu_dft_a, gpu_dft_b, flags=0, conjB=True)
+
+    # Download for magnitude normalization (no cuda.magnitude for 2-channel)
+    cross = gpu_cross.download()
+    eps = 1e-10
+    mag = np.sqrt(cross[:, :, 0] ** 2 + cross[:, :, 1] ** 2) + eps
+    cross[:, :, 0] /= mag
+    cross[:, :, 1] /= mag
+
+    # Inverse DFT on GPU
+    gpu_cross_norm = _to_gpu(cross)
+    gpu_idft = cv2.cuda.dft(
+        gpu_cross_norm, (h, w),
+        flags=cv2.DFT_INVERSE | cv2.DFT_REAL_OUTPUT | cv2.DFT_SCALE,
+    )
+    idft = gpu_idft.download()
+
+    # Find peak
+    _, max_val, _, max_loc = cv2.minMaxLoc(idft)
+
+    # Convert peak location to shift (handle wrap-around)
+    dx = float(max_loc[0])
+    dy = float(max_loc[1])
+    if dx > w // 2:
+        dx -= w
+    if dy > h // 2:
+        dy -= h
+
+    # Compute response as the peak sharpness (ratio of peak to mean)
+    mean_val = float(np.mean(np.abs(idft)))
+    response = (max_val / mean_val) if mean_val > 0 else 0.0
+    # Normalize to roughly match cv2.phaseCorrelate's response scale
+    response = min(1.0, response / 100.0)
+
+    return (dx, dy), response
+
+
 def _phase_correlation_affine(
     frame_a: np.ndarray,
     frame_b: np.ndarray,
@@ -400,6 +539,10 @@ def _phase_correlation_affine(
     Phase correlation uses the global frequency content of the overlap region,
     making it far more robust than local feature matching on dark, repetitive
     textures (e.g. rows of identical chairs in a dim church).
+
+    When CUDA is available, the DFT operations (the bulk of the computation)
+    run on the GPU via cv2.cuda.dft / mulSpectrums / idft, providing a
+    significant speed-up on large frames.
     """
     gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY).astype(np.float64)
     gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY).astype(np.float64)
@@ -415,7 +558,13 @@ def _phase_correlation_affine(
     gray_a = gray_a * window
     gray_b = gray_b * window
 
-    shift, response = cv2.phaseCorrelate(gray_a, gray_b)
+    if _USE_CUDA:
+        try:
+            shift, response = _phase_correlate_cuda(gray_a, gray_b)
+        except (cv2.error, Exception):
+            shift, response = cv2.phaseCorrelate(gray_a, gray_b)
+    else:
+        shift, response = cv2.phaseCorrelate(gray_a, gray_b)
 
     if response < _PHASE_CORR_MIN:
         return None
@@ -487,7 +636,10 @@ def _is_valid_affine(H: np.ndarray, frame_shape: Tuple[int, ...]) -> bool:
 def _deduplicate(
     frames: List[np.ndarray], threshold: float = 0.97,
 ) -> List[np.ndarray]:
-    """Remove near-duplicate consecutive frames based on histogram correlation."""
+    """Remove near-duplicate consecutive frames based on histogram correlation.
+
+    Uses CUDA-accelerated cvtColor + calcHist when available.
+    """
     if len(frames) <= 2:
         return frames
     unique = [frames[0]]
@@ -502,6 +654,18 @@ def _deduplicate(
 
 
 def _hist(frame: np.ndarray) -> np.ndarray:
+    if _USE_CUDA:
+        try:
+            gpu_frame = _to_gpu(frame)
+            gpu_gray = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2GRAY)
+            gpu_hist = cv2.cuda.calcHist(gpu_gray)
+            # cuda.calcHist returns 256-bin; we need 64-bin for consistency
+            hist_256 = gpu_hist.download().reshape(-1).astype(np.float32)
+            # Rebin 256 → 64 by summing groups of 4
+            hist_64 = hist_256.reshape(64, 4).sum(axis=1).reshape(64, 1)
+            return hist_64
+        except cv2.error:
+            pass
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return cv2.calcHist([gray], [0], None, [64], [0, 256])
 
@@ -675,10 +839,12 @@ def _warp_frame_for_gain_cuda(args):
 
     CUDA warpAffine is called sequentially (not thread-safe) but is still
     faster than the CPU path because each warp runs on the GPU.
+    Uses GPU cvtColor for the grayscale conversion.
     """
     frame, A_final, sw, sh, kernel = args
-    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gpu_g = _to_gpu(g)
+    gpu_frame = _to_gpu(frame)
+    gpu_gray = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2GRAY)
+    gpu_g = gpu_gray
     gpu_wg = cv2.cuda.warpAffine(
         gpu_g, A_final, (sw, sh),
         flags=cv2.INTER_LINEAR,
@@ -835,15 +1001,30 @@ def _normalize_exposures(frames: List[np.ndarray]) -> List[np.ndarray]:
     global median.  This brings dark and bright frames much closer in
     exposure *before* the global gain compensation and blending steps,
     dramatically reducing visible seams when lighting varies.
+
+    When CUDA is available, color conversions and arithmetic run on the GPU.
     """
     if len(frames) <= 1:
         return frames
 
     # Measure mean luminance of each frame
     means = []
-    for f in frames:
-        l_ch = cv2.cvtColor(f, cv2.COLOR_BGR2LAB)[:, :, 0]
-        means.append(float(l_ch.mean()))
+    if _USE_CUDA:
+        try:
+            for f in frames:
+                gpu_f = _to_gpu(f)
+                gpu_lab = cv2.cuda.cvtColor(gpu_f, cv2.COLOR_BGR2LAB)
+                lab = gpu_lab.download()
+                means.append(float(lab[:, :, 0].mean()))
+        except cv2.error:
+            means = []
+            for f in frames:
+                l_ch = cv2.cvtColor(f, cv2.COLOR_BGR2LAB)[:, :, 0]
+                means.append(float(l_ch.mean()))
+    else:
+        for f in frames:
+            l_ch = cv2.cvtColor(f, cv2.COLOR_BGR2LAB)[:, :, 0]
+            means.append(float(l_ch.mean()))
 
     target = float(np.median(means))
     if target < 1:
@@ -858,6 +1039,22 @@ def _normalize_exposures(frames: List[np.ndarray]) -> List[np.ndarray]:
         ratio = target / m
         # Clamp ratio to avoid extreme corrections on very dark frames
         ratio = max(0.3, min(ratio, 4.0))
+
+        if _USE_CUDA:
+            try:
+                gpu_f = _to_gpu(f)
+                gpu_lab = cv2.cuda.cvtColor(gpu_f, cv2.COLOR_BGR2LAB)
+                lab = gpu_lab.download()
+                # Scale L channel and clamp
+                lab_f32 = lab.astype(np.float32)
+                lab_f32[:, :, 0] = np.clip(lab_f32[:, :, 0] * ratio, 0, 255)
+                gpu_result = _to_gpu(lab_f32.astype(np.uint8))
+                gpu_bgr = cv2.cuda.cvtColor(gpu_result, cv2.COLOR_LAB2BGR)
+                out.append(gpu_bgr.download())
+                continue
+            except cv2.error:
+                pass  # Fall through to CPU path
+
         lab = cv2.cvtColor(f, cv2.COLOR_BGR2LAB).astype(np.float32)
         lab[:, :, 0] = np.clip(lab[:, :, 0] * ratio, 0, 255)
         out.append(cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR))
@@ -924,6 +1121,16 @@ def _composite_affine(
     weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
     kernel = np.ones((7, 7), np.uint8)
 
+    # Pre-create CUDA morphology filter for erosion (reuse across frames)
+    _gpu_erode_filter = None
+    if _USE_CUDA:
+        try:
+            _gpu_erode_filter = cv2.cuda.createMorphologyFilter(
+                cv2.MORPH_ERODE, cv2.CV_8U, kernel, iterations=3,
+            )
+        except (cv2.error, AttributeError):
+            _gpu_erode_filter = None
+
     for i, (frame, H) in enumerate(zip(frames, transforms)):
         H_final = T @ H
         A_final = H_final[:2, :]
@@ -937,7 +1144,6 @@ def _composite_affine(
                     borderMode=cv2.BORDER_CONSTANT,
                     borderValue=(0, 0, 0),
                 )
-                warped = gpu_warped.download()
 
                 frame_mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
                 gpu_mask = _to_gpu(frame_mask)
@@ -947,9 +1153,23 @@ def _composite_affine(
                     borderMode=cv2.BORDER_CONSTANT,
                     borderValue=0,
                 )
+
+                # Threshold + erode on GPU
                 warped_mask = gpu_warped_mask.download()
+                valid = (warped_mask > 128).astype(np.uint8)
+
+                if _gpu_erode_filter is not None:
+                    gpu_valid = _to_gpu(valid)
+                    gpu_eroded = _gpu_erode_filter.apply(gpu_valid)
+                    valid = gpu_eroded.download()
+                else:
+                    valid = cv2.erode(valid, kernel, iterations=3)
+
+                # Apply gain on GPU via multiply
+                warped = gpu_warped.download()
+                warped = np.clip(warped.astype(np.float32) * gains[i], 0, 255).astype(np.uint8)
             except cv2.error:
-                # Fall through to CPU path
+                # Full CPU fallback
                 warped = cv2.warpAffine(
                     frame, A_final, (canvas_w, canvas_h),
                     flags=cv2.INTER_LINEAR,
@@ -963,6 +1183,9 @@ def _composite_affine(
                     borderMode=cv2.BORDER_CONSTANT,
                     borderValue=0,
                 )
+                warped = np.clip(warped.astype(np.float32) * gains[i], 0, 255).astype(np.uint8)
+                valid = (warped_mask > 128).astype(np.uint8)
+                valid = cv2.erode(valid, kernel, iterations=3)
         else:
             warped = cv2.warpAffine(
                 frame, A_final, (canvas_w, canvas_h),
@@ -977,17 +1200,9 @@ def _composite_affine(
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0,
             )
-
-        # Apply gain compensation
-        warped = np.clip(warped.astype(np.float32) * gains[i], 0, 255).astype(np.uint8)
-
-        valid = (warped_mask > 128).astype(np.uint8)
-
-        # Erosion removes edge artefacts from lens distortion,
-        # vignetting, and warp-interpolation fringes that cause ghosting.
-        # 3 iterations with a 7×7 kernel removes ~21px from each edge —
-        # enough to hide interpolation fringes without creating black gaps.
-        valid = cv2.erode(valid, kernel, iterations=3)
+            warped = np.clip(warped.astype(np.float32) * gains[i], 0, 255).astype(np.uint8)
+            valid = (warped_mask > 128).astype(np.uint8)
+            valid = cv2.erode(valid, kernel, iterations=3)
 
         dist = cv2.distanceTransform(valid, cv2.DIST_L2, 5)
 
@@ -1558,7 +1773,19 @@ def _crop_black(img: np.ndarray) -> np.ndarray:
 
 
 def to_base64(frame: np.ndarray, quality: int = 85) -> str:
-    """Encode frame as base64 JPEG."""
+    """Encode frame as base64 JPEG.
+
+    Uses NVJPEG hardware encoder when available (via cv2.cudacodec) for
+    faster encoding of large panoramic images.  Falls back to CPU imencode.
+    """
+    if _USE_CUDA:
+        try:
+            gpu_frame = _to_gpu(frame)
+            # cudacodec.jpegEncode returns a bytes buffer encoded on GPU
+            buf = cv2.cudacodec.jpegEncode(gpu_frame, quality)
+            return base64.b64encode(buf).decode("utf-8")
+        except (cv2.error, AttributeError):
+            pass  # Fall through to CPU path
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return base64.b64encode(buf).decode("utf-8")
 
