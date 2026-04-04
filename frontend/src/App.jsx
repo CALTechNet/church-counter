@@ -274,6 +274,7 @@ export default function App() {
       {scanState.running && (() => {
         const isProcessing = scanState.progress >= 90
         const isInitiating = scanState.progress === 0
+        const SECS_PER_FRAME = 5 // ~5 seconds per scanner frame
         const PROCESSING_SECS = 600 // ~10 minutes for stitching + counting
         const formatTime = (secs) => {
           const m = Math.floor(secs / 60)
@@ -283,12 +284,19 @@ export default function App() {
         let timeStr = ''
         if (scanStartedAt) {
           if (!isProcessing) {
-            // Capture phase: estimate from elapsed time + progress
+            // Capture phase: estimate based on 5 seconds per frame
             const elapsed = (now - scanStartedAt) / 1000
-            const pct = Math.max(scanState.progress, 1)
-            const captureTotal = (elapsed / pct) * 88 // time for 0-88%
-            const captureRemaining = Math.max(0, captureTotal - elapsed)
-            timeStr = `~${formatTime(Math.round(captureRemaining + PROCESSING_SECS))} remaining`
+            if (totalPositions && totalPositions > 0) {
+              const captureTotal = totalPositions * SECS_PER_FRAME
+              const captureRemaining = Math.max(0, captureTotal - elapsed)
+              timeStr = `~${formatTime(Math.round(captureRemaining + PROCESSING_SECS))} remaining`
+            } else {
+              // Fallback: estimate from elapsed time + progress
+              const pct = Math.max(scanState.progress, 1)
+              const captureTotal = (elapsed / pct) * 88
+              const captureRemaining = Math.max(0, captureTotal - elapsed)
+              timeStr = `~${formatTime(Math.round(captureRemaining + PROCESSING_SECS))} remaining`
+            }
           } else if (processingStartedAt) {
             // Processing phase: 10-min countdown for stitching + counting
             const processingElapsed = (now - processingStartedAt) / 1000
