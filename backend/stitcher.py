@@ -44,7 +44,7 @@ try:
         _USE_CUDA = True
         logger.info(
             "CUDA OpenCV enabled — device 0: %s  "
-            "(ORB, BFMatcher, remap, CLAHE, warpAffine, templateMatch, "
+            "(ORB, BFMatcher, CLAHE, warpAffine, templateMatch, "
             "DFT phase-correlation, morphology, cvtColor, calcHist, jpegEncode)",
             cv2.cuda.getDevice(),
         )
@@ -59,73 +59,6 @@ def _to_gpu(mat: np.ndarray) -> cv2.cuda.GpuMat:  # type: ignore[attr-defined]
     gpu = cv2.cuda.GpuMat()
     gpu.upload(mat)
     return gpu
-
-# ---------------------------------------------------------------------------
-# Lens distortion correction
-# ---------------------------------------------------------------------------
-
-def undistort_frame(frame: np.ndarray, k1: float = -0.32, k2: float = 0.12) -> np.ndarray:
-    """Remove barrel/pincushion distortion from a PTZ camera frame.
-
-    Uses the Brown–Conrady model with radial coefficients *k1* and *k2*.
-    Negative k1 corrects barrel distortion (edges curve inward);
-    positive k1 corrects pincushion distortion.
-
-    The camera matrix is synthesised from the frame dimensions, assuming
-    the optical centre is at the image centre and focal length is
-    approximately equal to the frame width (typical for PTZ cameras at
-    moderate-to-high zoom).
-
-    When CUDA is available, uses GPU-accelerated remap for the undistortion.
-    """
-    if k1 == 0.0 and k2 == 0.0:
-        return frame
-
-    h, w = frame.shape[:2]
-    fx = fy = float(w)
-    cx, cy = w / 2.0, h / 2.0
-
-    camera_matrix = np.array([
-        [fx,  0, cx],
-        [ 0, fy, cy],
-        [ 0,  0,  1],
-    ], dtype=np.float64)
-
-    dist_coeffs = np.array([k1, k2, 0, 0, 0], dtype=np.float64)
-
-    new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
-        camera_matrix, dist_coeffs, (w, h), alpha=0.5,
-    )
-
-    if _USE_CUDA:
-        try:
-            # Compute remap tables on CPU (small), then remap on GPU (fast)
-            map1, map2 = cv2.initUndistortRectifyMap(
-                camera_matrix, dist_coeffs, None, new_camera_matrix,
-                (w, h), cv2.CV_32FC1,
-            )
-            gpu_frame = _to_gpu(frame)
-            gpu_map1 = _to_gpu(map1)
-            gpu_map2 = _to_gpu(map2)
-            gpu_result = cv2.cuda.remap(
-                gpu_frame, gpu_map1, gpu_map2,
-                interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=(0, 0, 0),
-            )
-            undistorted = gpu_result.download()
-        except cv2.error:
-            undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_camera_matrix)
-    else:
-        undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_camera_matrix)
-
-    # Crop to the valid ROI to remove black borders from remapping
-    rx, ry, rw, rh = roi
-    if rw > 0 and rh > 0:
-        undistorted = undistorted[ry:ry + rh, rx:rx + rw]
-
-    return undistorted
-
 
 # ---------------------------------------------------------------------------
 # Enhancement
@@ -1578,26 +1511,17 @@ def _stitch_grid(
         logger.info(f"  Row {r}: stitching {len(row_frames)} frames horizontally")
         row_tasks.append((r, row_frames, row_pos))
 
-    def _stitch_row(task):
-        r, row_frames, row_pos = task
-        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos, constrain_transform="similarity")
-        mean_pos = None
-        if strip is not None and row_pos:
-            mean_pos = (np.mean([p[0] for p in row_pos]), np.mean([p[1] for p in row_pos]))
-        return r, strip, mean_pos
-
-    n_row_workers = min(len(row_tasks), os.cpu_count() or 4)
+    # Stitch rows sequentially — CUDA operations are not thread-safe,
+    # so we cannot use ThreadPoolExecutor here.
     row_strips: List[np.ndarray] = []
     row_strip_positions: List[Optional[Tuple[float, float]]] = []
 
-    with ThreadPoolExecutor(max_workers=n_row_workers) as pool:
-        results = list(pool.map(_stitch_row, row_tasks))
-
-    # Collect results in row order
-    for r, strip, mean_pos in sorted(results, key=lambda x: x[0]):
+    for r, row_frames, row_pos in row_tasks:
+        strip = _stitch_strip(row_frames, direction="horizontal", positions=row_pos, constrain_transform="similarity")
         if strip is not None:
             row_strips.append(strip)
-            if mean_pos:
+            if row_pos:
+                mean_pos = (np.mean([p[0] for p in row_pos]), np.mean([p[1] for p in row_pos]))
                 row_strip_positions.append(mean_pos)
     gc.collect()
 
@@ -1684,9 +1608,6 @@ def stitch_frames(
       - "calibrated"→ Grid-aware affine stitching with position guidance
       - None        → auto-select based on whether grid_shape is provided
 
-    Barrel / pincushion lens distortion is automatically corrected on
-    each frame before stitching (via ``undistort_frame``).
-
     Returns (panorama_image, status_string).
     """
     if not frames:
@@ -1694,19 +1615,6 @@ def stitch_frames(
 
     if len(frames) == 1:
         return frames[0], "single_frame"
-
-    # --- Automatic lens distortion correction ---
-    logger.info(
-        f"Applying lens undistortion to {len(frames)} frames "
-        f"(CUDA={'yes' if _USE_CUDA else 'no'})"
-    )
-    if _USE_CUDA:
-        # CUDA remap is not thread-safe — run sequentially on GPU
-        frames = [undistort_frame(f) for f in frames]
-    else:
-        n_workers = min(len(frames), os.cpu_count() or 4)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            frames = list(pool.map(undistort_frame, frames))
 
     # Route to the correct algorithm based on scan mode
     if scan_mode == "preset" and grid_shape is not None:
