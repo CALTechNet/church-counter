@@ -693,22 +693,53 @@ async def _calibrated_scan(
         frames.append(f)
     await prog(f"Position 1/{total} (pan={pan0}, tilt={tilt0}) — {len(frames)} total", 0)
 
-    # Move through remaining positions with position verification
+    # Move through remaining positions with position verification.
+    # Use moderate speed (not max) to prevent motor overshoot — especially
+    # on column transitions where the camera changes pan direction.
+    SCAN_PAN_SPEED = 18
+    SCAN_TILT_SPEED = 14
+    prev_pan, prev_tilt = pan0, tilt0
     for i, (pan, tilt) in enumerate(positions[1:], 1):
         if cancelled():
             return frames, (rows, cols), positions
         pct = int((i / total) * 88)
-        await move_abs(pan, tilt, pan_speed=24, tilt_speed=20)
-        await _await_position(
+
+        # Detect column transition: pan changed (horizontal move)
+        is_col_transition = (pan != prev_pan)
+
+        await move_abs(pan, tilt, pan_speed=SCAN_PAN_SPEED, tilt_speed=SCAN_TILT_SPEED)
+        arrived = await _await_position(
             pan, tilt,
-            lambda p=pan, t=tilt: move_abs(p, t, pan_speed=24, tilt_speed=20),
+            lambda p=pan, t=tilt: move_abs(p, t, pan_speed=SCAN_PAN_SPEED, tilt_speed=SCAN_TILT_SPEED),
         )
+
+        if not arrived:
+            # Camera didn't reach target — log actual position for diagnosis
+            actual = await asyncio.to_thread(_get_position_sync)
+            logger.warning(
+                f"Position {i+1}/{total}: camera did not reach target "
+                f"pan={pan} tilt={tilt} — actual pan={actual.get('pan')} "
+                f"tilt={actual.get('tilt')}. Retrying once more."
+            )
+            # One final attempt with a brief pause
+            await asyncio.sleep(0.3)
+            await move_abs(pan, tilt, pan_speed=SCAN_PAN_SPEED, tilt_speed=SCAN_TILT_SPEED)
+            await _await_position(
+                pan, tilt,
+                lambda p=pan, t=tilt: move_abs(p, t, pan_speed=SCAN_PAN_SPEED, tilt_speed=SCAN_TILT_SPEED),
+            )
+
+        # Brief extra settle time on column transitions to let motor stabilise
+        if is_col_transition:
+            await asyncio.sleep(0.15)
+
         f = await asyncio.to_thread(capture_frame)
         frames_this = 0
         if f is not None:
             frames.append(f)
             frames_this += 1
 
+        prev_pan, prev_tilt = pan, tilt
         await prog(
             f"Position {i+1}/{total} (pan={pan}, tilt={tilt}) — {frames_this} frames, {len(frames)} total",
             pct,
