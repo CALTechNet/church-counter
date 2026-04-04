@@ -51,6 +51,9 @@ TRAVEL_TIME      = 1.5   # seconds camera takes to travel between adjacent prese
 SETTLE_TIME      = 0     # extra seconds to wait after travel before final capture
 CAPTURE_INTERVAL = 0.25  # seconds between frame captures during movement
 
+# ── Grid spacing ─────────────────────────────────────────────────────────────
+STEP_MULTIPLIER  = 1.5   # scale factor for pan/tilt step sizes (>1 = fewer, wider-spaced positions)
+
 # ── Position verification constants ──────────────────────────────────────────
 POS_TOLERANCE    = 10    # pan/tilt units — positions within this are "arrived"
 POS_POLL_INTERVAL = 0.05 # seconds between position polls
@@ -630,7 +633,7 @@ async def _calibrated_scan(
     # perspective distortion per degree of tilt than pan, so we need
     # denser vertical overlap to prevent the stitcher from scaling
     # frames to match features across tilt transitions.
-    pan_step  = max(25, int(1_000_000 / zoom))
+    pan_step  = max(25, int(1_000_000 / zoom * STEP_MULTIPLIER))
     tilt_step = max(25, int(pan_step * 0.65))
     pan_range  = abs(pan_br  - pan_tl)
     tilt_range = abs(tilt_br - tilt_tl)
