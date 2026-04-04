@@ -480,35 +480,6 @@ def get_live_frame() -> Optional[np.ndarray]:
 
 # ── Auto-scan ─────────────────────────────────────────────────────────────────
 
-def _reorder_to_boustrophedon(presets: List[int], rows: int, cols: int) -> List[int]:
-    """Reorder presets from row-major order to column-major boustrophedon.
-
-    Presets are assumed to be stored in row-major order (left→right per row,
-    top→bottom).  This reorders them into column-major boustrophedon
-    (top→bottom for even columns, bottom→top for odd columns) so that each
-    transition is a short move to an adjacent position — matching the order
-    expected by the grid-aware stitcher.
-    """
-    # Build 2D grid from row-major order
-    grid: List[List[Optional[int]]] = []
-    idx = 0
-    for r in range(rows):
-        row = []
-        for c in range(cols):
-            row.append(presets[idx] if idx < len(presets) else None)
-            idx += 1
-        grid.append(row)
-
-    # Read out in column-major boustrophedon order
-    result: List[int] = []
-    for col in range(cols):
-        row_range = range(rows) if col % 2 == 0 else range(rows - 1, -1, -1)
-        for row in row_range:
-            if grid[row][col] is not None:
-                result.append(grid[row][col])
-    return result
-
-
 async def _preset_scan(
     presets: List[int],
     progress_callback: Optional[ProgressCB] = None,
@@ -552,15 +523,7 @@ async def _preset_scan(
     if preset_cols and preset_cols > 0 and total >= preset_cols:
         rows = math.ceil(total / preset_cols)
         grid_shape = (rows, preset_cols)
-        # Reorder presets from row-major to column-major boustrophedon so
-        # the camera follows a serpentine path (short adjacent moves) instead
-        # of sweeping back across the full width at each row transition.
-        presets = _reorder_to_boustrophedon(presets, rows, preset_cols)
-        total = len(presets)
-        logger.info(
-            f"Preset scan: grid mode {rows} rows × {preset_cols} cols "
-            f"(boustrophedon order: {presets[:6]}{'…' if total > 6 else ''})"
-        )
+        logger.info(f"Preset scan: grid mode {rows} rows × {preset_cols} cols")
 
     await prog("Starting preset scan…", 0)
 
