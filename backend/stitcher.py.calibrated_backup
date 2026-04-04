@@ -1509,17 +1509,18 @@ def stitch_frames(
         panorama, status = _stitch_opencv(frames)
     elif scan_mode == "calibrated" and grid_shape is not None:
         rows, cols = grid_shape
-        logger.info(
-            f"Calibrated scan with grid {rows}×{cols}: using OpenCV stitcher "
-            f"(all {len(frames)} frames at once)"
-        )
-        panorama, status = _stitch_opencv(frames)
+        if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
+            panorama, status = _stitch_grid(frames, rows, cols, positions=positions)
+        else:
+            logger.warning(
+                f"Calibrated mode but grid shape {grid_shape} doesn't match "
+                f"frame count {len(frames)}, falling back to OpenCV stitcher"
+            )
+            panorama, status = _stitch_opencv(frames)
     elif scan_mode == "calibrated":
-        logger.info(
-            f"Calibrated mode without grid info: using OpenCV stitcher "
-            f"(all {len(frames)} frames at once)"
-        )
-        panorama, status = _stitch_opencv(frames)
+        # Calibrated mode without grid info — fall back to sequential
+        logger.warning("Calibrated mode but no grid_shape provided, using sequential stitch")
+        panorama, status = _stitch_sequential(frames)
     elif grid_shape is not None:
         rows, cols = grid_shape
         if rows > 0 and cols > 0 and len(frames) >= rows * cols * 0.5:
