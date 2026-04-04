@@ -1,0 +1,24 @@
+# Version control
+.git
+.gitignore
+
+# Runtime data (mounted as volumes)
+data/
+models/
+
+# Node modules (npm ci runs inside the container)
+frontend/node_modules
+frontend/build
+
+# Docker files
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Misc
+*.md
+*.sh
+config.env
+__pycache__
+*.pyc
+.env

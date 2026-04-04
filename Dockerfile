@@ -16,12 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
+# Python deps — single layer, no cache, strip __pycache__/.pyc to save ~200 MB
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Upgrade ultralytics to fix PyTorch 2.6 weights_only compatibility
-RUN pip install --upgrade ultralytics
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --upgrade ultralytics && \
+    find /usr/local/lib/python* -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; true
 
 # Backend source
 COPY backend/ ./backend/
