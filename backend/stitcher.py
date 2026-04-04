@@ -33,7 +33,15 @@ _USE_CUDA = False
 _cuda_stream: Optional[cv2.cuda.Stream] = None  # type: ignore[attr-defined]
 
 try:
-    if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+    _has_cuda_attr = hasattr(cv2, "cuda")
+    _cuda_device_count = 0
+    if _has_cuda_attr:
+        try:
+            _cuda_device_count = cv2.cuda.getCudaEnabledDeviceCount()
+        except Exception as _e:
+            logger.warning("cv2.cuda.getCudaEnabledDeviceCount() raised: %s", _e)
+
+    if _has_cuda_attr and _cuda_device_count > 0:
         cv2.cuda.setDevice(0)
         _cuda_stream = cv2.cuda.Stream()
         # Smoke-test: upload a tiny mat and download it
@@ -49,9 +57,33 @@ try:
             cv2.cuda.getDevice(),
         )
     else:
-        logger.info("No CUDA-enabled OpenCV detected; stitcher will use CPU")
+        logger.warning(
+            "No CUDA-enabled OpenCV detected; stitcher will use CPU.  "
+            "Diagnostics: cv2.cuda exists=%s, device_count=%d, "
+            "cv2.getBuildInformation() CUDA lines: %s",
+            _has_cuda_attr,
+            _cuda_device_count,
+            [
+                l.strip()
+                for l in cv2.getBuildInformation().split("\n")
+                if "CUDA" in l or "NVIDIA" in l or "NPP" in l or "CUFFT" in l
+            ],
+        )
 except Exception as exc:
     logger.warning("CUDA probe failed (%s); stitcher falling back to CPU", exc)
+
+# Log OpenCV threading backend so we can verify multi-core is active
+_thread_info = [
+    l.strip()
+    for l in cv2.getBuildInformation().split("\n")
+    if "Parallel" in l or "TBB" in l or "pthreads" in l or "OpenMP" in l
+]
+logger.info(
+    "OpenCV threading: %s  (OPENCV_THREAD_COUNT=%s, cpu_count=%s)",
+    _thread_info or ["no parallel backend found"],
+    os.environ.get("OPENCV_THREAD_COUNT", "unset"),
+    os.cpu_count(),
+)
 
 
 def _to_gpu(mat: np.ndarray) -> cv2.cuda.GpuMat:  # type: ignore[attr-defined]

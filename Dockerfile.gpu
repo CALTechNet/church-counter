@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-dev pkg-config \
     libavcodec-dev libavformat-dev libswscale-dev \
     libgtk2.0-dev \
+    libtbb-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -28,9 +29,12 @@ WORKDIR /build/opencv/build
 
 # CUDA_ARCH_BIN covers:
 #   6.1 = GTX 1050/1060/1070/1080 (Pascal)
+#   7.0 = Tesla V100 / Titan V (Volta)
 #   7.5 = RTX 2000 / GTX 1650 Super (Turing)
-#   8.6 = RTX 3000 series (Ampere)
+#   8.0 = A100 / RTX A6000 (Ampere datacenter)
+#   8.6 = RTX 3000 series (Ampere consumer)
 #   8.9 = RTX 4000 series (Ada Lovelace)
+#   9.0 = RTX 5000 series (Blackwell)  PTX=9.0 for forward compat
 RUN cmake .. \
     -GNinja \
     -DCMAKE_BUILD_TYPE=Release \
@@ -41,8 +45,10 @@ RUN cmake .. \
     -DWITH_CUDNN=ON \
     -DOPENCV_DNN_CUDA=ON \
     -DWITH_CUBLAS=ON \
-    -DCUDA_ARCH_BIN="6.1;7.5;8.6;8.9" \
-    -DCUDA_ARCH_PTX="8.9" \
+    -DWITH_CUFFT=ON \
+    -DWITH_TBB=ON \
+    -DCUDA_ARCH_BIN="6.1;7.0;7.5;8.0;8.6;8.9;9.0" \
+    -DCUDA_ARCH_PTX="9.0" \
     -DBUILD_opencv_python3=ON \
     -DBUILD_opencv_python2=OFF \
     -DPYTHON3_EXECUTABLE=/usr/bin/python3 \
@@ -68,8 +74,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libsm6 libxext6 libxrender1 libgl1 libgomp1 \
     libavcodec58 libavformat58 libswscale5 \
     ffmpeg \
+    libtbb2 \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
+
+# CUDA runtime libraries that OpenCV CUDA modules link against at runtime.
+# The base nvidia/cuda runtime image has libcudart but may be missing NPP,
+# cuFFT, and cuBLAS runtime libs needed by cv2.cuda.warpAffine, cvtColor,
+# DFT, ORB, etc.  Without these, cv2.cuda.getCudaEnabledDeviceCount()
+# returns 0 and the stitcher silently falls back to single-threaded CPU.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnpp-12-4 \
+    libcufft-12-4 \
+    libcublas-12-4 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ldconfig
 
 # Copy OpenCV CUDA build from builder
 COPY --from=opencv-builder /opt/opencv /opt/opencv
