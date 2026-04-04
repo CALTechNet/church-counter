@@ -263,6 +263,14 @@ function ScanPathMap({ bounds, ptzPos, scanning, scanProgress, totalPositions, i
 
   const { positions, rows, cols, zoom, left, right, top, bottom } = grid
 
+  // Normalize bounds so min→max maps to 0→1 regardless of sign or direction
+  const minPan  = Math.min(left, right)
+  const maxPan  = Math.max(left, right)
+  const minTilt = Math.min(top, bottom)
+  const maxTilt = Math.max(top, bottom)
+  const panSpan  = maxPan  - minPan  || 1
+  const tiltSpan = maxTilt - minTilt || 1
+
   // How many positions are completed during a scan (progress 0-88% = capture phase)
   const completedCount = scanning && totalPositions > 0
     ? Math.min(Math.round((Math.min(scanProgress, 88) / 88) * positions.length), positions.length)
@@ -270,14 +278,14 @@ function ScanPathMap({ bounds, ptzPos, scanning, scanProgress, totalPositions, i
 
   // SVG dimensions — preserve pan/tilt aspect ratio
   const svgW = isMobile ? 160 : 148
-  const padL = 30, padR = 8, padT = 8, padB = 20
+  const padL = 36, padR = 8, padT = 8, padB = 20
   const mapW = svgW - padL - padR
-  const aspect = Math.abs(bottom - top) / Math.max(Math.abs(right - left), 1)
+  const aspect = tiltSpan / Math.max(panSpan, 1)
   const mapH = Math.max(40, Math.min(100, Math.round(mapW * aspect)))
   const svgH = mapH + padT + padB
 
-  const toX = pan => padL + ((pan - left) / Math.max(right - left, 1)) * mapW
-  const toY = tilt => padT + ((tilt - top) / Math.max(bottom - top, 1)) * mapH
+  const toX = pan  => padL + ((pan  - minPan)  / panSpan)  * mapW
+  const toY = tilt => padT + ((tilt - minTilt) / tiltSpan) * mapH
 
   // Path strings
   const fullPath = positions.map((p, i) =>
@@ -296,22 +304,22 @@ function ScanPathMap({ bounds, ptzPos, scanning, scanProgress, totalPositions, i
   const curY = hasCur ? toY(ptzPos.tilt) : 0
   // Clamp to map area for display
   const curInBounds = hasCur
-    && ptzPos.pan >= Math.min(left, right) - 50 && ptzPos.pan <= Math.max(left, right) + 50
-    && ptzPos.tilt >= Math.min(top, bottom) - 50 && ptzPos.tilt <= Math.max(top, bottom) + 50
+    && ptzPos.pan >= minPan - 50 && ptzPos.pan <= maxPan + 50
+    && ptzPos.tilt >= minTilt - 50 && ptzPos.tilt <= maxTilt + 50
 
-  // Tick values for axes (show ~3-4 values along each axis)
+  // Tick values for axes (show ~3-4 values along each axis, spanning full range)
   const xTicks = []
   const xCount = Math.min(cols, 4)
   for (let i = 0; i < xCount; i++) {
     const frac = i / Math.max(xCount - 1, 1)
-    const val = Math.round(left + (right - left) * frac)
+    const val = Math.round(minPan + panSpan * frac)
     xTicks.push(val)
   }
   const yTicks = []
   const yCount = Math.min(rows, 4)
   for (let i = 0; i < yCount; i++) {
     const frac = i / Math.max(yCount - 1, 1)
-    const val = Math.round(top + (bottom - top) * frac)
+    const val = Math.round(minTilt + tiltSpan * frac)
     yTicks.push(val)
   }
 
