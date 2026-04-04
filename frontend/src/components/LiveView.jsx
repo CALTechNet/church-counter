@@ -285,7 +285,7 @@ function ScanPathMap({ bounds, ptzPos, scanning, scanProgress, totalPositions, i
   const svgH = mapH + padT + padB
 
   const toX = pan  => padL + ((pan  - minPan)  / panSpan)  * mapW
-  const toY = tilt => padT + ((tilt - minTilt) / tiltSpan) * mapH
+  const toY = tilt => padT + ((maxTilt - tilt) / tiltSpan) * mapH
 
   // Path strings
   const fullPath = positions.map((p, i) =>
